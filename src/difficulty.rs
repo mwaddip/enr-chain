@@ -52,8 +52,20 @@ fn previous_heights_for_recalculation(
     use_last_epochs: u32,
 ) -> Vec<u32> {
     if (height - 1).is_multiple_of(epoch_length) && epoch_length > 1 {
+        // Branch 1: epoch boundary with epoch_length > 1. Filter out negative heights
+        // (not enough history to fill all use_last_epochs slots).
         let mut heights: Vec<u32> = (0..=use_last_epochs)
             .filter_map(|i| (height - 1).checked_sub(i * epoch_length))
+            .collect();
+        heights.reverse();
+        heights
+    } else if (height - 1).is_multiple_of(epoch_length)
+        && height > epoch_length * use_last_epochs
+    {
+        // Branch 2: epoch boundary with epoch_length <= 1 (i.e. epoch_length == 1)
+        // and enough history. All heights are guaranteed non-negative by the guard.
+        let mut heights: Vec<u32> = (0..=use_last_epochs)
+            .map(|i| (height - 1) - i * epoch_length)
             .collect();
         heights.reverse();
         heights
@@ -261,6 +273,23 @@ mod tests {
         // Height 247 (= 2*123 + 1), epoch_length=123, use_last_epochs=4
         let heights = previous_heights_for_recalculation(247, 123, 4);
         assert_eq!(heights, vec![0, 123, 246]);
+    }
+
+    #[test]
+    fn test_previous_heights_epoch_length_1() {
+        // epochLength=1, height=10, use_last_epochs=4
+        // Branch 2: (10-1) % 1 == 0 && 10 > 1 * 4
+        // Heights: (0..=4).map(|i| 9 - i) = [9,8,7,6,5], reversed = [5,6,7,8,9]
+        let heights = previous_heights_for_recalculation(10, 1, 4);
+        assert_eq!(heights, vec![5, 6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn test_previous_heights_epoch_length_1_insufficient_history() {
+        // epochLength=1, height=3, use_last_epochs=4
+        // Branch 2 condition: 3 > 1 * 4 is false → falls to branch 3
+        let heights = previous_heights_for_recalculation(3, 1, 4);
+        assert_eq!(heights, vec![2]);
     }
 
     #[test]
