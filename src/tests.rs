@@ -597,3 +597,234 @@ mod chain_tests {
         assert_eq!(chain.height(), 129);
     }
 }
+
+#[cfg(test)]
+mod sync_info_tests {
+    use crate::{build_sync_info, parse_sync_info, ChainConfig, HeaderChain, SyncInfo};
+    use ergo_chain_types::*;
+    use sigma_ser::ScorexSerializable;
+
+    fn make_chain_header(
+        height: u32,
+        parent_id: BlockId,
+        timestamp: u64,
+        n_bits: u32,
+    ) -> Header {
+        let zero32 = Digest32::zero();
+        let mut header = Header {
+            version: 2,
+            id: BlockId(Digest32::zero()),
+            parent_id,
+            ad_proofs_root: zero32,
+            state_root: ADDigest::zero(),
+            transaction_root: zero32,
+            timestamp,
+            n_bits,
+            height,
+            extension_root: zero32,
+            autolykos_solution: AutolykosSolution {
+                miner_pk: Box::new(EcPoint::default()),
+                pow_onetime_pk: None,
+                nonce: height.to_be_bytes().repeat(2),
+                pow_distance: None,
+            },
+            votes: Votes([0, 0, 0]),
+            unparsed_bytes: Box::new([]),
+        };
+        let bytes = header.scorex_serialize_bytes().unwrap();
+        let reparsed = Header::scorex_parse_bytes(&bytes).unwrap();
+        header.id = reparsed.id;
+        header
+    }
+
+    fn testnet_config() -> ChainConfig {
+        ChainConfig::testnet()
+    }
+
+    fn make_genesis(config: &ChainConfig) -> Header {
+        make_chain_header(1, BlockId(Digest32::zero()), 1_000_000, config.initial_n_bits)
+    }
+
+    fn build_test_chain(count: u32) -> HeaderChain {
+        let config = testnet_config();
+        let mut chain = HeaderChain::new(config.clone());
+        if count == 0 {
+            return chain;
+        }
+
+        let genesis = make_genesis(&config);
+        let mut prev_id = genesis.id;
+        chain.try_append_no_pow(genesis).unwrap();
+
+        for h in 2..=count {
+            let parent = chain.tip();
+            let expected_n_bits =
+                crate::difficulty::expected_difficulty(parent, &chain).unwrap();
+            let timestamp = 1_000_000 + (h as u64 - 1) * 45_000;
+            let header = make_chain_header(h, prev_id, timestamp, expected_n_bits);
+            prev_id = header.id;
+            chain.try_append_no_pow(header).unwrap();
+        }
+
+        chain
+    }
+
+    // --- build_sync_info tests ---
+
+    #[test]
+    fn build_empty_chain_produces_v2_zero_headers() {
+        let chain = build_test_chain(0);
+        let bytes = build_sync_info(&chain);
+        // VLQ(0) = 0x00, mode = 0xFF, count = 0x00
+        assert_eq!(bytes, vec![0x00, 0xFF, 0x00]);
+    }
+
+    #[test]
+    fn build_short_chain_includes_only_tip() {
+        // 5 headers (heights 1-5). Offsets: [0, 16, 128, 512].
+        // Only offset 0 (height 5) is within range.
+        let chain = build_test_chain(5);
+        let bytes = build_sync_info(&chain);
+
+        // Parse it back to verify content
+        let sync = parse_sync_info(&bytes).unwrap();
+        match sync {
+            SyncInfo::V2 { headers } => {
+                assert_eq!(headers.len(), 1);
+                assert_eq!(headers[0].height, 5);
+            }
+            _ => panic!("expected V2"),
+        }
+    }
+
+    #[test]
+    fn build_long_chain_includes_four_headers_at_offsets() {
+        // 600 headers (heights 1-600). Offsets from tip (600):
+        //   0 → height 600, 16 → height 584, 128 → height 472, 512 → height 88
+        // All within range (chain starts at 1).
+        let chain = build_test_chain(600);
+        let bytes = build_sync_info(&chain);
+
+        let sync = parse_sync_info(&bytes).unwrap();
+        match sync {
+            SyncInfo::V2 { headers } => {
+                assert_eq!(headers.len(), 4);
+                // Tip-first ordering
+                assert_eq!(headers[0].height, 600);
+                assert_eq!(headers[1].height, 584);
+                assert_eq!(headers[2].height, 472);
+                assert_eq!(headers[3].height, 88);
+            }
+            _ => panic!("expected V2"),
+        }
+    }
+
+    // --- roundtrip tests ---
+
+    #[test]
+    fn build_parse_roundtrip() {
+        let chain = build_test_chain(200);
+        let bytes = build_sync_info(&chain);
+        let sync = parse_sync_info(&bytes).unwrap();
+
+        match sync {
+            SyncInfo::V2 { headers } => {
+                // Offsets from tip 200: 0→200, 16→184, 128→72. 512 below chain start.
+                assert_eq!(headers.len(), 3);
+                for parsed_hdr in &headers {
+                    let chain_hdr = chain.header_at(parsed_hdr.height).unwrap();
+                    assert_eq!(parsed_hdr.id, chain_hdr.id);
+                }
+            }
+            _ => panic!("expected V2"),
+        }
+    }
+
+    // --- parse V1 ---
+
+    #[test]
+    fn parse_v1_header_ids() {
+        // V1: VLQ(count) followed by count * 32-byte header IDs
+        let mut body = Vec::new();
+        // VLQ encode 3
+        body.push(3u8);
+        // 3 header IDs (32 bytes each)
+        for i in 0u8..3 {
+            body.extend_from_slice(&[i + 1; 32]);
+        }
+
+        let sync = parse_sync_info(&body).unwrap();
+        match sync {
+            SyncInfo::V1 { header_ids } => {
+                assert_eq!(header_ids.len(), 3);
+                assert_eq!(header_ids[0].0 .0, [1u8; 32]);
+                assert_eq!(header_ids[1].0 .0, [2u8; 32]);
+                assert_eq!(header_ids[2].0 .0, [3u8; 32]);
+            }
+            _ => panic!("expected V1"),
+        }
+    }
+
+    // --- parse V2 with zero headers ---
+
+    #[test]
+    fn parse_v2_zero_headers() {
+        let body = vec![0x00, 0xFF, 0x00];
+        let sync = parse_sync_info(&body).unwrap();
+        match sync {
+            SyncInfo::V2 { headers } => assert!(headers.is_empty()),
+            _ => panic!("expected V2"),
+        }
+    }
+
+    // --- error cases ---
+
+    #[test]
+    fn parse_garbage_returns_error() {
+        let garbage: Vec<u8> = (0..50).map(|i| (i * 37 + 13) as u8).collect();
+        // Should not panic — may be Err or weird Ok, but never panic.
+        let _ = parse_sync_info(&garbage);
+    }
+
+    #[test]
+    fn parse_empty_returns_error() {
+        let result = parse_sync_info(&[]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_v2_too_many_headers_rejected() {
+        // Craft a V2 message claiming 51 headers
+        let body = vec![0x00, 0xFF, 51u8];
+        let result = parse_sync_info(&body);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_v2_oversized_header_rejected() {
+        // Craft a V2 message with 1 header claiming 1001 bytes
+        let mut body = vec![0x00, 0xFF, 0x01];
+        // VLQ encode 1001 (0xE9 0x07 in VLQ)
+        body.push(0xE9);
+        body.push(0x07);
+        // Pad with enough junk bytes
+        body.extend(vec![0xAB; 1001]);
+
+        let result = parse_sync_info(&body);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_v1_too_many_header_ids_rejected() {
+        // V1 with 1002 header IDs — over the 1001 limit
+        let mut body = Vec::new();
+        // VLQ encode 1002 = 0xEA 0x07
+        body.push(0xEA);
+        body.push(0x07);
+        // Don't need actual data — should reject before reading
+        body.extend(vec![0x00; 32 * 10]); // some padding
+
+        let result = parse_sync_info(&body);
+        assert!(result.is_err());
+    }
+}

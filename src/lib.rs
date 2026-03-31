@@ -9,6 +9,7 @@ mod config;
 pub(crate) mod difficulty;
 mod error;
 mod pow;
+mod sync_info;
 #[cfg(test)]
 mod tests;
 mod tracker;
@@ -18,13 +19,14 @@ pub use config::ChainConfig;
 pub use ergo_chain_types::{BlockId, Header};
 pub use error::ChainError;
 pub use pow::verify_pow;
+pub use sync_info::{build_sync_info, parse_sync_info, SyncInfo};
 pub use tracker::HeaderTracker;
 
 use sigma_ser::ScorexSerializable;
 
 /// Parse an `ergo-chain-types::Header` from raw Scorex-serialized bytes.
 ///
-/// The `data` argument is the raw payload from a ModifierResponse with modifier_type = 1.
+/// The `data` argument is the raw payload from a ModifierResponse with modifier_type = 101 (Header).
 /// The header's `id` field is computed automatically (blake2b256 of the serialized header).
 ///
 /// Never panics on malformed input — returns `Err(ChainError::Parse)` instead.

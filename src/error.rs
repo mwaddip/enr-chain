@@ -52,4 +52,8 @@ pub enum ChainError {
     /// Difficulty calculation failed.
     #[error("difficulty calculation error: {0}")]
     DifficultyCalc(String),
+
+    /// SyncInfo message is malformed or violates constraints.
+    #[error("SyncInfo error: {0}")]
+    SyncInfo(String),
 }
