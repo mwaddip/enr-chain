@@ -320,3 +320,280 @@ mod tracker_tests {
         assert_eq!(tracker.best_height(), None);
     }
 }
+
+#[cfg(test)]
+mod chain_tests {
+    use crate::{ChainConfig, ChainError, HeaderChain};
+    use ergo_chain_types::*;
+    use sigma_ser::ScorexSerializable;
+
+    /// Build a header with a computed ID. For chain tests — no real PoW.
+    fn make_chain_header(
+        height: u32,
+        parent_id: BlockId,
+        timestamp: u64,
+        n_bits: u32,
+    ) -> Header {
+        let zero32 = Digest32::zero();
+        let mut header = Header {
+            version: 2,
+            id: BlockId(Digest32::zero()),
+            parent_id,
+            ad_proofs_root: zero32,
+            state_root: ADDigest::zero(),
+            transaction_root: zero32,
+            timestamp,
+            n_bits,
+            height,
+            extension_root: zero32,
+            autolykos_solution: AutolykosSolution {
+                miner_pk: Box::new(EcPoint::default()),
+                pow_onetime_pk: None,
+                nonce: height.to_be_bytes().repeat(2),
+                pow_distance: None,
+            },
+            votes: Votes([0, 0, 0]),
+            unparsed_bytes: Box::new([]),
+        };
+
+        // Compute ID via serialization roundtrip
+        let bytes = header.scorex_serialize_bytes().unwrap();
+        let reparsed = Header::scorex_parse_bytes(&bytes).unwrap();
+        header.id = reparsed.id;
+        header
+    }
+
+    fn genesis_parent_id() -> BlockId {
+        BlockId(Digest32::zero())
+    }
+
+    fn testnet_config() -> ChainConfig {
+        ChainConfig::testnet()
+    }
+
+    fn make_genesis(config: &ChainConfig) -> Header {
+        make_chain_header(1, genesis_parent_id(), 1_000_000, config.initial_n_bits)
+    }
+
+    #[test]
+    fn empty_chain() {
+        let chain = HeaderChain::new(testnet_config());
+        assert!(chain.is_empty());
+        assert_eq!(chain.height(), 0);
+        assert_eq!(chain.len(), 0);
+    }
+
+    #[test]
+    fn append_genesis() {
+        let config = testnet_config();
+        let mut chain = HeaderChain::new(config.clone());
+        let genesis = make_genesis(&config);
+        let genesis_id = genesis.id;
+
+        assert!(chain.try_append_no_pow(genesis).is_ok());
+        assert_eq!(chain.height(), 1);
+        assert_eq!(chain.len(), 1);
+        assert!(chain.contains(&genesis_id));
+        assert_eq!(chain.header_at(1).unwrap().id, genesis_id);
+    }
+
+    #[test]
+    fn reject_genesis_wrong_parent() {
+        let config = testnet_config();
+        let mut chain = HeaderChain::new(config.clone());
+        // Genesis with non-zero parent
+        let bad = make_chain_header(1, BlockId(Digest32::from([1u8; 32])), 1_000_000, config.initial_n_bits);
+
+        let err = chain.try_append_no_pow(bad).unwrap_err();
+        assert!(matches!(err, ChainError::InvalidGenesisParent { .. }));
+    }
+
+    #[test]
+    fn reject_genesis_wrong_height() {
+        let config = testnet_config();
+        let mut chain = HeaderChain::new(config.clone());
+        let bad = make_chain_header(5, genesis_parent_id(), 1_000_000, config.initial_n_bits);
+
+        let err = chain.try_append_no_pow(bad).unwrap_err();
+        assert!(matches!(err, ChainError::InvalidGenesisHeight { .. }));
+    }
+
+    #[test]
+    fn reject_genesis_wrong_difficulty() {
+        let config = testnet_config();
+        let mut chain = HeaderChain::new(config);
+        let bad = make_chain_header(1, genesis_parent_id(), 1_000_000, 99999);
+
+        let err = chain.try_append_no_pow(bad).unwrap_err();
+        assert!(matches!(err, ChainError::WrongDifficulty { .. }));
+    }
+
+    #[test]
+    fn append_child_after_genesis() {
+        let config = testnet_config();
+        let mut chain = HeaderChain::new(config.clone());
+        let genesis = make_genesis(&config);
+        let parent_id = genesis.id;
+        let parent_n_bits = genesis.n_bits;
+
+        chain.try_append_no_pow(genesis).unwrap();
+
+        // Child at height 2 — within first epoch, so n_bits carries forward
+        let child = make_chain_header(2, parent_id, 2_000_000, parent_n_bits);
+        assert!(chain.try_append_no_pow(child).is_ok());
+        assert_eq!(chain.height(), 2);
+        assert_eq!(chain.len(), 2);
+    }
+
+    #[test]
+    fn reject_child_wrong_parent() {
+        let config = testnet_config();
+        let mut chain = HeaderChain::new(config.clone());
+        let genesis = make_genesis(&config);
+        chain.try_append_no_pow(genesis).unwrap();
+
+        // Child pointing to a non-existent parent
+        let bad = make_chain_header(2, BlockId(Digest32::from([0xAB; 32])), 2_000_000, config.initial_n_bits);
+        let err = chain.try_append_no_pow(bad).unwrap_err();
+        assert!(matches!(err, ChainError::ParentNotFound { .. }));
+    }
+
+    #[test]
+    fn reject_child_wrong_height() {
+        let config = testnet_config();
+        let mut chain = HeaderChain::new(config.clone());
+        let genesis = make_genesis(&config);
+        let parent_id = genesis.id;
+        chain.try_append_no_pow(genesis).unwrap();
+
+        // Height 5 after genesis (should be 2)
+        let bad = make_chain_header(5, parent_id, 2_000_000, config.initial_n_bits);
+        let err = chain.try_append_no_pow(bad).unwrap_err();
+        assert!(matches!(err, ChainError::NonSequentialHeight { .. }));
+    }
+
+    #[test]
+    fn reject_child_timestamp_not_increasing() {
+        let config = testnet_config();
+        let mut chain = HeaderChain::new(config.clone());
+        let genesis = make_genesis(&config);
+        let parent_id = genesis.id;
+        chain.try_append_no_pow(genesis).unwrap();
+
+        // Timestamp equal to genesis (should be strictly greater)
+        let bad = make_chain_header(2, parent_id, 1_000_000, config.initial_n_bits);
+        let err = chain.try_append_no_pow(bad).unwrap_err();
+        assert!(matches!(err, ChainError::TimestampNotIncreasing { .. }));
+    }
+
+    #[test]
+    fn reject_child_wrong_difficulty() {
+        let config = testnet_config();
+        let mut chain = HeaderChain::new(config.clone());
+        let genesis = make_genesis(&config);
+        let parent_id = genesis.id;
+        chain.try_append_no_pow(genesis).unwrap();
+
+        // Wrong n_bits (should inherit from parent within epoch)
+        let bad = make_chain_header(2, parent_id, 2_000_000, 99999);
+        let err = chain.try_append_no_pow(bad).unwrap_err();
+        assert!(matches!(err, ChainError::WrongDifficulty { .. }));
+    }
+
+    #[test]
+    fn difficulty_carries_within_epoch() {
+        // Build a chain of several blocks within the first epoch.
+        // All should have the same n_bits as genesis.
+        let config = testnet_config();
+        let mut chain = HeaderChain::new(config.clone());
+
+        let genesis = make_genesis(&config);
+        let mut prev_id = genesis.id;
+        let n_bits = genesis.n_bits;
+        chain.try_append_no_pow(genesis).unwrap();
+
+        for h in 2..=10 {
+            let header = make_chain_header(h, prev_id, 1_000_000 + h as u64 * 45_000, n_bits);
+            prev_id = header.id;
+            chain.try_append_no_pow(header).unwrap();
+        }
+
+        assert_eq!(chain.height(), 10);
+        assert_eq!(chain.len(), 10);
+        // All headers should have the same difficulty
+        for h in 1..=10 {
+            assert_eq!(chain.header_at(h).unwrap().n_bits, n_bits);
+        }
+    }
+
+    #[test]
+    fn headers_from_range() {
+        let config = testnet_config();
+        let mut chain = HeaderChain::new(config.clone());
+
+        let genesis = make_genesis(&config);
+        let mut prev_id = genesis.id;
+        let n_bits = genesis.n_bits;
+        chain.try_append_no_pow(genesis).unwrap();
+
+        for h in 2..=5 {
+            let header = make_chain_header(h, prev_id, 1_000_000 + h as u64 * 45_000, n_bits);
+            prev_id = header.id;
+            chain.try_append_no_pow(header).unwrap();
+        }
+
+        let slice = chain.headers_from(2, 3);
+        assert_eq!(slice.len(), 3);
+        assert_eq!(slice[0].height, 2);
+        assert_eq!(slice[1].height, 3);
+        assert_eq!(slice[2].height, 4);
+
+        // Beyond chain end
+        let slice = chain.headers_from(4, 10);
+        assert_eq!(slice.len(), 2); // heights 4, 5
+
+        // Before chain start
+        let slice = chain.headers_from(0, 5);
+        assert_eq!(slice.len(), 0);
+    }
+
+    #[test]
+    fn difficulty_recalculation_at_epoch_boundary() {
+        // Build a chain of 129 blocks (genesis at 1, epoch_length=128).
+        // Block 129 triggers recalculation (parent at height 128 = epoch boundary).
+        let config = testnet_config();
+        let mut chain = HeaderChain::new(config.clone());
+
+        let genesis = make_genesis(&config);
+        let mut prev_id = genesis.id;
+        let n_bits = genesis.n_bits;
+        chain.try_append_no_pow(genesis).unwrap();
+
+        // Build up to height 128 with perfect timing (45s apart)
+        for h in 2..=128 {
+            let timestamp = 1_000_000 + (h as u64 - 1) * 45_000;
+            let header = make_chain_header(h, prev_id, timestamp, n_bits);
+            prev_id = header.id;
+            chain.try_append_no_pow(header).unwrap();
+        }
+
+        assert_eq!(chain.height(), 128);
+
+        // Height 129 triggers difficulty recalculation.
+        // With perfect block timing (45s intervals), the difficulty should stay
+        // approximately the same (the actual result depends on the linear regression
+        // with only one epoch of data, which returns the same difficulty).
+        let parent = chain.tip();
+        let expected_n_bits =
+            crate::difficulty::expected_difficulty(parent, &chain).unwrap();
+
+        let header129 = make_chain_header(
+            129,
+            prev_id,
+            1_000_000 + 128 * 45_000,
+            expected_n_bits,
+        );
+        assert!(chain.try_append_no_pow(header129).is_ok());
+        assert_eq!(chain.height(), 129);
+    }
+}

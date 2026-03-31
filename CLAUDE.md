@@ -2,6 +2,10 @@
 
 Header chain validation for the Ergo Rust node. Owns header parsing, PoW verification, difficulty adjustment, and chain validation. The single authority on whether a chain of headers is valid.
 
+## OVERRIDES (LOAD FIRST)
+
+**Read and internalize `~/projects/OVERRIDES.md` before anything else.** It contains mechanical overrides for code quality, edit safety, and context management that apply across all projects.
+
 ## SETTINGS.md (HIGHEST PRIORITY)
 
 **Read and internalize the main repo's `SETTINGS.md` before any work.** It defines persona, preferences, and behavioral overrides.

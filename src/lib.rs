@@ -2,13 +2,19 @@
 //!
 //! Phase 1: Parse headers from wire bytes, track best known height.
 //! Phase 2: Verify proof of work before accepting headers.
+//! Phase 3: Validate headers form a correct chain (parent, timestamp, difficulty).
 
+mod chain;
+mod config;
+pub(crate) mod difficulty;
 mod error;
 mod pow;
 #[cfg(test)]
 mod tests;
 mod tracker;
 
+pub use chain::HeaderChain;
+pub use config::ChainConfig;
 pub use ergo_chain_types::{BlockId, Header};
 pub use error::ChainError;
 pub use pow::verify_pow;

@@ -1,4 +1,5 @@
 use ergo_chain_types::autolykos_pow_scheme::AutolykosPowSchemeError;
+use ergo_chain_types::BlockId;
 use sigma_ser::ScorexParsingError;
 
 /// Errors that can occur in header chain operations.
@@ -15,4 +16,40 @@ pub enum ChainError {
     /// Error computing proof-of-work hit.
     #[error("PoW computation error: {0}")]
     PowCompute(#[from] AutolykosPowSchemeError),
+
+    /// Header's parent_id doesn't match any header in the chain.
+    #[error("parent not found: {parent_id}")]
+    ParentNotFound { parent_id: BlockId },
+
+    /// Header height is not parent height + 1.
+    #[error("non-sequential height: expected {expected}, got {got}")]
+    NonSequentialHeight { expected: u32, got: u32 },
+
+    /// Header timestamp is not strictly greater than parent's.
+    #[error("timestamp not increasing: parent {parent_ts}, got {got}")]
+    TimestampNotIncreasing { parent_ts: u64, got: u64 },
+
+    /// Header timestamp is too far in the future.
+    #[error("timestamp too far in future: {timestamp} > max {max_allowed}")]
+    TimestampTooFarInFuture { timestamp: u64, max_allowed: u64 },
+
+    /// Header nBits doesn't match the expected difficulty for this height.
+    #[error("wrong difficulty at height {height}: expected {expected}, got {got}")]
+    WrongDifficulty {
+        height: u32,
+        expected: u32,
+        got: u32,
+    },
+
+    /// Genesis header has wrong parent ID (must be all zeros).
+    #[error("invalid genesis parent: {got}")]
+    InvalidGenesisParent { got: BlockId },
+
+    /// Genesis header has wrong height (must be 1).
+    #[error("invalid genesis height: expected 1, got {got}")]
+    InvalidGenesisHeight { got: u32 },
+
+    /// Difficulty calculation failed.
+    #[error("difficulty calculation error: {0}")]
+    DifficultyCalc(String),
 }
