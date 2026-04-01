@@ -155,26 +155,27 @@ impl HeaderChain {
 
     #[cfg(test)]
     fn validate_child_no_pow(&self, header: &Header) -> Result<(), ChainError> {
-        let parent = self
-            .by_id
-            .get(&header.parent_id)
-            .and_then(|&h| self.header_at(h))
-            .ok_or(ChainError::ParentNotFound { parent_id: header.parent_id })?;
+        let tip = self.by_height.last().expect("validate_child_no_pow called on non-empty chain");
 
-        if header.height != parent.height + 1 {
+        // Linear chain: parent must be the current tip
+        if header.parent_id != tip.id {
+            return Err(ChainError::ParentNotFound { parent_id: header.parent_id });
+        }
+
+        if header.height != tip.height + 1 {
             return Err(ChainError::NonSequentialHeight {
-                expected: parent.height + 1,
+                expected: tip.height + 1,
                 got: header.height,
             });
         }
-        if header.timestamp <= parent.timestamp {
+        if header.timestamp <= tip.timestamp {
             return Err(ChainError::TimestampNotIncreasing {
-                parent_ts: parent.timestamp,
+                parent_ts: tip.timestamp,
                 got: header.timestamp,
             });
         }
         // Skip future timestamp check in tests — constructed timestamps are in the past
-        let expected_n_bits = crate::difficulty::expected_difficulty(parent, self)?;
+        let expected_n_bits = crate::difficulty::expected_difficulty(tip, self)?;
         if header.n_bits != expected_n_bits {
             return Err(ChainError::WrongDifficulty {
                 height: header.height,
@@ -218,26 +219,27 @@ impl HeaderChain {
     }
 
     fn validate_child(&self, header: &Header) -> Result<(), ChainError> {
-        let parent = self
-            .by_id
-            .get(&header.parent_id)
-            .and_then(|&h| self.header_at(h))
-            .ok_or(ChainError::ParentNotFound {
-                parent_id: header.parent_id,
-            })?;
+        let tip = self.by_height.last().expect("validate_child called on non-empty chain");
 
-        // Height must be parent + 1
-        if header.height != parent.height + 1 {
+        // Linear chain: parent must be the current tip
+        if header.parent_id != tip.id {
+            return Err(ChainError::ParentNotFound {
+                parent_id: header.parent_id,
+            });
+        }
+
+        // Height must be tip + 1
+        if header.height != tip.height + 1 {
             return Err(ChainError::NonSequentialHeight {
-                expected: parent.height + 1,
+                expected: tip.height + 1,
                 got: header.height,
             });
         }
 
         // Timestamp must be strictly increasing
-        if header.timestamp <= parent.timestamp {
+        if header.timestamp <= tip.timestamp {
             return Err(ChainError::TimestampNotIncreasing {
-                parent_ts: parent.timestamp,
+                parent_ts: tip.timestamp,
                 got: header.timestamp,
             });
         }
@@ -255,7 +257,7 @@ impl HeaderChain {
         }
 
         // Difficulty must be correct
-        let expected_n_bits = crate::difficulty::expected_difficulty(parent, self)?;
+        let expected_n_bits = crate::difficulty::expected_difficulty(tip, self)?;
         if header.n_bits != expected_n_bits {
             return Err(ChainError::WrongDifficulty {
                 height: header.height,

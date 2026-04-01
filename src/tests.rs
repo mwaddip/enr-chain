@@ -501,6 +501,52 @@ mod chain_tests {
     }
 
     #[test]
+    fn reject_duplicate_header() {
+        // A header already in the chain must not be accepted again.
+        let config = testnet_config();
+        let mut chain = HeaderChain::new(config.clone());
+        let genesis = make_genesis(&config);
+        chain.try_append_no_pow(genesis).unwrap();
+
+        // Build a chain of 10 headers
+        for h in 2..=10 {
+            let tip = chain.tip();
+            let expected_n_bits = crate::difficulty::expected_difficulty(tip, &chain).unwrap();
+            let header = make_chain_header(h, tip.id, 1_000_000 + h as u64 * 45_000, expected_n_bits);
+            chain.try_append_no_pow(header).unwrap();
+        }
+
+        // Try to append a clone of the header at height 5
+        let existing = chain.header_at(5).unwrap().clone();
+        let result = chain.try_append_no_pow(existing);
+        assert!(result.is_err(), "duplicate header should be rejected");
+    }
+
+    #[test]
+    fn reject_header_extending_non_tip() {
+        // A header whose parent exists in the chain but is not the tip
+        // must be rejected — the chain is linear.
+        let config = testnet_config();
+        let mut chain = HeaderChain::new(config.clone());
+        let genesis = make_genesis(&config);
+        chain.try_append_no_pow(genesis).unwrap();
+
+        // Build chain to height 10
+        for h in 2..=10 {
+            let tip = chain.tip();
+            let expected_n_bits = crate::difficulty::expected_difficulty(tip, &chain).unwrap();
+            let header = make_chain_header(h, tip.id, 1_000_000 + h as u64 * 45_000, expected_n_bits);
+            chain.try_append_no_pow(header).unwrap();
+        }
+
+        // Build a valid-looking child of height-5 header (not the tip)
+        let mid_header = chain.header_at(5).unwrap();
+        let fork_child = make_chain_header(6, mid_header.id, mid_header.timestamp + 1000, config.initial_n_bits);
+        let result = chain.try_append_no_pow(fork_child);
+        assert!(result.is_err(), "header extending non-tip should be rejected");
+    }
+
+    #[test]
     fn difficulty_carries_within_epoch() {
         // Build a chain of several blocks within the first epoch.
         // All should have the same n_bits as genesis.
