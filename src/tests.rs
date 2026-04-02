@@ -874,3 +874,102 @@ mod sync_info_tests {
         assert!(result.is_err());
     }
 }
+
+#[cfg(test)]
+mod section_tests {
+    use crate::section_ids;
+
+    fn hex(bytes: &[u8; 32]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Verify section IDs against JVM-computed values for a real mainnet header.
+    /// Header at height 2870 — section IDs from the JVM node's JSON output.
+    #[test]
+    fn section_ids_match_jvm_test_vector() {
+        let json = r#"{"extensionId":"277907e4e5e42f27e928e6101cc4fec173bee5d7728794b73d7448c339c380e5","difficulty":"1325481984","votes":"000000","timestamp":1611225263165,"size":219,"stateRoot":"c0d0b5eafd07b22487dac66628669c42a242b90bef3e1fcdc76d83140d58b6bc0e","height":2870,"nBits":72286528,"version":2,"id":"5b0ce6711de6b926f60b67040cc4512804517785df375d063f1bf1d75588af3a","adProofsRoot":"49453875a43035c7640dee2f905efe06128b00d41acd2c8df13691576d4fd85c","transactionsRoot":"770cbb6e18673ed025d386487f15d3252115d9a6f6c9b947cf3d04731dd6ab75","extensionHash":"9bc7d54583c5d44bb62a7be0473cd78d601822a626afc13b636f2cbff0d87faf","powSolutions":{"pk":"0288114b0586efea9f86e4587f2071bc1c85fb77e15eba96b2769733e0daf57903","w":"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","n":"000100000580a91b","d":0},"adProofsId":"4fc36d59bf26a672e01fbfde1445bd66f50e0f540f24102e1e27d0be1a99dfbf","transactionsId":"d196ef8a7ef582ab1fdab4ef807715183705301c6ae2ff0dcbe8f1d577ba081f","parentId":"ab19e6c7a4062979dddb534df83f236d1b949c7cef18bcf434a67e87c593eef9"}"#;
+
+        let header: ergo_chain_types::Header = serde_json::from_str(json).unwrap();
+        let ids = section_ids(&header);
+
+        // BlockTransactions (type 102)
+        assert_eq!(ids[0].0, 102);
+        assert_eq!(
+            hex(&ids[0].1),
+            "d196ef8a7ef582ab1fdab4ef807715183705301c6ae2ff0dcbe8f1d577ba081f"
+        );
+
+        // ADProofs (type 104)
+        assert_eq!(ids[1].0, 104);
+        assert_eq!(
+            hex(&ids[1].1),
+            "4fc36d59bf26a672e01fbfde1445bd66f50e0f540f24102e1e27d0be1a99dfbf"
+        );
+
+        // Extension (type 108)
+        assert_eq!(ids[2].0, 108);
+        assert_eq!(
+            hex(&ids[2].1),
+            "277907e4e5e42f27e928e6101cc4fec173bee5d7728794b73d7448c339c380e5"
+        );
+    }
+
+    /// Same but for a second header (height 614400) to avoid single-vector luck.
+    #[test]
+    fn section_ids_second_vector() {
+        let json = r#"{
+            "extensionId" : "00cce45975d87414e8bdd8146bc88815be59cd9fe37a125b5021101e05675a18",
+            "difficulty" : "16384",
+            "votes" : "000000",
+            "timestamp" : 4928911477310178288,
+            "size" : 223,
+            "stateRoot" : "5c8c00b8403d3701557181c8df800001b6d5009e2201c6ff807d71808c00019780",
+            "height" : 614400,
+            "nBits" : 37748736,
+            "version" : 2,
+            "id" : "5603a937ec1988220fc44fb5022fb82d5565b961f005ebb55d85bd5a9e6f801f",
+            "adProofsRoot" : "5d3f80dcff7f5e7f59007294c180808d0158d1ff6ba10000f901c7f0ef87dcff",
+            "transactionsRoot" : "f17fffacb6ff7f7f1180d2ff7f1e24ffffe1ff937f807f0797b9ff6ebdae007e",
+            "extensionHash" : "1480887f80007f4b01cf7f013ff1ffff564a0000b9a54f00770e807f41ff88c0",
+            "powSolutions" : {
+              "pk" : "03bedaee069ff4829500b3c07c4d5fe6b3ea3d3bf76c5c28c1d4dcdb1bed0ade0c",
+              "n" : "0000000000003105"
+            },
+            "adProofsId" : "dec129290a763f4de41f04e87e2b661dd59758af6bdd00dd51f5d97c3a8cb9b5",
+            "transactionsId" : "eba1dd82cf51147232e09c1f72b37c554c30f63274d5093bff36849a83472a42",
+            "parentId" : "ac2101807f0000ca01ff0119db227f202201007f62000177a080005d440896d0"
+        }"#;
+
+        let header: ergo_chain_types::Header = serde_json::from_str(json).unwrap();
+        let ids = section_ids(&header);
+
+        assert_eq!(ids[0].0, 102);
+        assert_eq!(
+            hex(&ids[0].1),
+            "eba1dd82cf51147232e09c1f72b37c554c30f63274d5093bff36849a83472a42"
+        );
+
+        assert_eq!(ids[1].0, 104);
+        assert_eq!(
+            hex(&ids[1].1),
+            "dec129290a763f4de41f04e87e2b661dd59758af6bdd00dd51f5d97c3a8cb9b5"
+        );
+
+        assert_eq!(ids[2].0, 108);
+        assert_eq!(
+            hex(&ids[2].1),
+            "00cce45975d87414e8bdd8146bc88815be59cd9fe37a125b5021101e05675a18"
+        );
+    }
+
+    /// Section IDs are deterministic — same header produces same IDs.
+    #[test]
+    fn section_ids_deterministic() {
+        let json = r#"{"extensionId":"277907e4e5e42f27e928e6101cc4fec173bee5d7728794b73d7448c339c380e5","difficulty":"1325481984","votes":"000000","timestamp":1611225263165,"size":219,"stateRoot":"c0d0b5eafd07b22487dac66628669c42a242b90bef3e1fcdc76d83140d58b6bc0e","height":2870,"nBits":72286528,"version":2,"id":"5b0ce6711de6b926f60b67040cc4512804517785df375d063f1bf1d75588af3a","adProofsRoot":"49453875a43035c7640dee2f905efe06128b00d41acd2c8df13691576d4fd85c","transactionsRoot":"770cbb6e18673ed025d386487f15d3252115d9a6f6c9b947cf3d04731dd6ab75","extensionHash":"9bc7d54583c5d44bb62a7be0473cd78d601822a626afc13b636f2cbff0d87faf","powSolutions":{"pk":"0288114b0586efea9f86e4587f2071bc1c85fb77e15eba96b2769733e0daf57903","w":"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","n":"000100000580a91b","d":0},"adProofsId":"4fc36d59bf26a672e01fbfde1445bd66f50e0f540f24102e1e27d0be1a99dfbf","transactionsId":"d196ef8a7ef582ab1fdab4ef807715183705301c6ae2ff0dcbe8f1d577ba081f","parentId":"ab19e6c7a4062979dddb534df83f236d1b949c7cef18bcf434a67e87c593eef9"}"#;
+
+        let header: ergo_chain_types::Header = serde_json::from_str(json).unwrap();
+        let ids1 = section_ids(&header);
+        let ids2 = section_ids(&header);
+        assert_eq!(ids1, ids2);
+    }
+}
