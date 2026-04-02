@@ -645,6 +645,208 @@ mod chain_tests {
 }
 
 #[cfg(test)]
+mod reorg_tests {
+    use crate::{ChainConfig, HeaderChain};
+    use ergo_chain_types::*;
+    use sigma_ser::ScorexSerializable;
+
+    fn make_chain_header(
+        height: u32,
+        parent_id: BlockId,
+        timestamp: u64,
+        n_bits: u32,
+    ) -> Header {
+        make_chain_header_with_nonce(height, parent_id, timestamp, n_bits, height.to_be_bytes().repeat(2))
+    }
+
+    /// Build a header with a specific nonce — different nonces at the same
+    /// height produce different IDs, simulating competing blocks.
+    fn make_chain_header_with_nonce(
+        height: u32,
+        parent_id: BlockId,
+        timestamp: u64,
+        n_bits: u32,
+        nonce: Vec<u8>,
+    ) -> Header {
+        let zero32 = Digest32::zero();
+        let mut header = Header {
+            version: 2,
+            id: BlockId(Digest32::zero()),
+            parent_id,
+            ad_proofs_root: zero32,
+            state_root: ADDigest::zero(),
+            transaction_root: zero32,
+            timestamp,
+            n_bits,
+            height,
+            extension_root: zero32,
+            autolykos_solution: AutolykosSolution {
+                miner_pk: Box::new(EcPoint::default()),
+                pow_onetime_pk: None,
+                nonce,
+                pow_distance: None,
+            },
+            votes: Votes([0, 0, 0]),
+            unparsed_bytes: Box::new([]),
+        };
+        let bytes = header.scorex_serialize_bytes().unwrap();
+        let reparsed = Header::scorex_parse_bytes(&bytes).unwrap();
+        header.id = reparsed.id;
+        header
+    }
+
+    fn testnet_config() -> ChainConfig {
+        ChainConfig::testnet()
+    }
+
+    fn make_genesis(config: &ChainConfig) -> Header {
+        make_chain_header(1, BlockId(Digest32::zero()), 1_000_000, config.initial_n_bits)
+    }
+
+    /// Build a chain of `count` headers, returning the chain.
+    fn build_test_chain(count: u32) -> HeaderChain {
+        let config = testnet_config();
+        let mut chain = HeaderChain::new(config.clone());
+        if count == 0 {
+            return chain;
+        }
+
+        let genesis = make_genesis(&config);
+        chain.try_append_no_pow(genesis).unwrap();
+
+        for h in 2..=count {
+            let tip = chain.tip();
+            let expected_n_bits = crate::difficulty::expected_difficulty(tip, &chain).unwrap();
+            let header = make_chain_header(h, tip.id, 1_000_000 + (h as u64 - 1) * 45_000, expected_n_bits);
+            chain.try_append_no_pow(header).unwrap();
+        }
+
+        chain
+    }
+
+    #[test]
+    fn basic_1_deep_reorg() {
+        // Chain: [1, 2, 3] with tip at height 3.
+        // Create competing block at height 3 (same parent as current tip) + continuation at height 4.
+        let mut chain = build_test_chain(3);
+        let old_tip_id = chain.tip().id;
+        let parent = chain.header_at(2).unwrap();
+        let parent_id = parent.id;
+        let parent_ts = parent.timestamp;
+        let n_bits = parent.n_bits;
+
+        // Alternative block at height 3 — same parent as current tip, different nonce
+        let alt_tip = make_chain_header_with_nonce(
+            3, parent_id, parent_ts + 50_000, n_bits,
+            vec![0xFF; 8], // different nonce → different ID
+        );
+        assert_ne!(alt_tip.id, old_tip_id, "alternative must have different ID");
+
+        // Continuation at height 4 building on the alternative
+        let continuation = make_chain_header(4, alt_tip.id, parent_ts + 100_000, n_bits);
+
+        let replaced = chain.try_reorg_no_pow(alt_tip.clone(), continuation.clone()).unwrap();
+
+        assert_eq!(replaced, old_tip_id);
+        assert_eq!(chain.height(), 4);
+        assert_eq!(chain.len(), 4);
+        assert_eq!(chain.header_at(3).unwrap().id, alt_tip.id);
+        assert_eq!(chain.header_at(4).unwrap().id, continuation.id);
+        assert!(!chain.contains(&old_tip_id), "old tip should be removed");
+        assert!(chain.contains(&alt_tip.id));
+        assert!(chain.contains(&continuation.id));
+    }
+
+    #[test]
+    fn reorg_rejected_alternative_wrong_parent() {
+        // Alternative doesn't share parent with current tip — not a competing block.
+        let mut chain = build_test_chain(3);
+        let n_bits = chain.tip().n_bits;
+
+        // Alternative pointing to some random parent
+        let alt_tip = make_chain_header_with_nonce(
+            3, BlockId(Digest32::from([0xAB; 32])), 2_100_000, n_bits,
+            vec![0xFF; 8],
+        );
+        let continuation = make_chain_header(4, alt_tip.id, 2_200_000, n_bits);
+
+        let result = chain.try_reorg_no_pow(alt_tip, continuation);
+        assert!(result.is_err());
+        assert_eq!(chain.height(), 3, "chain should be unchanged");
+    }
+
+    #[test]
+    fn reorg_rejected_continuation_wrong_parent() {
+        // Continuation doesn't build on the alternative.
+        let mut chain = build_test_chain(3);
+        let parent = chain.header_at(2).unwrap();
+        let parent_id = parent.id;
+        let parent_ts = parent.timestamp;
+        let n_bits = parent.n_bits;
+
+        let alt_tip = make_chain_header_with_nonce(
+            3, parent_id, parent_ts + 50_000, n_bits,
+            vec![0xFF; 8],
+        );
+        // Continuation points to wrong parent (not the alternative)
+        let continuation = make_chain_header(4, BlockId(Digest32::from([0xCD; 32])), parent_ts + 100_000, n_bits);
+
+        let result = chain.try_reorg_no_pow(alt_tip, continuation);
+        assert!(result.is_err());
+        assert_eq!(chain.height(), 3, "chain should be unchanged");
+    }
+
+    #[test]
+    fn reorg_rejected_alternative_wrong_height() {
+        // Alternative at wrong height (not same as current tip).
+        let mut chain = build_test_chain(3);
+        let parent = chain.header_at(2).unwrap();
+        let parent_id = parent.id;
+        let parent_ts = parent.timestamp;
+        let n_bits = parent.n_bits;
+
+        // Height 5 instead of 3
+        let alt_tip = make_chain_header_with_nonce(
+            5, parent_id, parent_ts + 50_000, n_bits,
+            vec![0xFF; 8],
+        );
+        let continuation = make_chain_header(6, alt_tip.id, parent_ts + 100_000, n_bits);
+
+        let result = chain.try_reorg_no_pow(alt_tip, continuation);
+        assert!(result.is_err());
+        assert_eq!(chain.height(), 3);
+    }
+
+    #[test]
+    fn reorg_rejected_on_empty_chain() {
+        let config = testnet_config();
+        let mut chain = HeaderChain::new(config.clone());
+
+        let alt = make_chain_header(1, BlockId(Digest32::zero()), 1_000_000, config.initial_n_bits);
+        let cont = make_chain_header(2, alt.id, 2_000_000, config.initial_n_bits);
+
+        let result = chain.try_reorg_no_pow(alt, cont);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn reorg_rejected_on_single_header_chain() {
+        // Can't reorg genesis — there's no parent to fall back to.
+        let mut chain = build_test_chain(1);
+        let n_bits = chain.tip().n_bits;
+
+        let alt = make_chain_header_with_nonce(
+            1, BlockId(Digest32::zero()), 1_000_000, n_bits,
+            vec![0xFF; 8],
+        );
+        let cont = make_chain_header(2, alt.id, 2_000_000, n_bits);
+
+        let result = chain.try_reorg_no_pow(alt, cont);
+        assert!(result.is_err());
+    }
+}
+
+#[cfg(test)]
 mod sync_info_tests {
     use crate::{build_sync_info, parse_sync_info, ChainConfig, HeaderChain, SyncInfo};
     use ergo_chain_types::*;

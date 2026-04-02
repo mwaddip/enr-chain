@@ -9,7 +9,7 @@ use crate::error::ChainError;
 ///
 /// Every header in the chain has been checked for parent linkage, timestamp
 /// bounds, PoW validity, and correct difficulty. The chain is append-only
-/// and linear (no fork handling yet).
+/// and linear with 1-deep reorganization support.
 pub struct HeaderChain {
     config: ChainConfig,
     /// Headers indexed by height. Since the chain is linear, each height
@@ -115,6 +115,148 @@ impl HeaderChain {
     /// Whether the chain is empty.
     pub fn is_empty(&self) -> bool {
         self.by_height.is_empty()
+    }
+
+    /// Perform a 1-deep chain reorganization.
+    ///
+    /// Replaces the current tip with `alternative_tip` (a competing block at the
+    /// same height sharing the same parent), then appends `continuation` on top.
+    ///
+    /// Returns the ID of the replaced tip on success.
+    pub fn try_reorg(
+        &mut self,
+        alternative_tip: Header,
+        continuation: Header,
+    ) -> Result<BlockId, ChainError> {
+        self.try_reorg_impl(alternative_tip, continuation, true)
+    }
+
+    /// Test variant of `try_reorg` that skips PoW verification.
+    #[cfg(test)]
+    pub(crate) fn try_reorg_no_pow(
+        &mut self,
+        alternative_tip: Header,
+        continuation: Header,
+    ) -> Result<BlockId, ChainError> {
+        self.try_reorg_impl(alternative_tip, continuation, false)
+    }
+
+    fn try_reorg_impl(
+        &mut self,
+        alternative_tip: Header,
+        continuation: Header,
+        verify_pow: bool,
+    ) -> Result<BlockId, ChainError> {
+        // Need at least 2 headers — can't reorg genesis.
+        if self.by_height.len() < 2 {
+            return Err(ChainError::Reorg(
+                "chain too short for reorg (need at least 2 headers)".into(),
+            ));
+        }
+
+        let tip_height = self.height();
+        let tip_parent_id = self.tip().parent_id;
+
+        // Alternative must compete at the same height with the same parent.
+        if alternative_tip.height != tip_height {
+            return Err(ChainError::Reorg(format!(
+                "alternative height {} != tip height {tip_height}",
+                alternative_tip.height,
+            )));
+        }
+        if alternative_tip.parent_id != tip_parent_id {
+            return Err(ChainError::Reorg(
+                "alternative parent doesn't match tip's parent".into(),
+            ));
+        }
+
+        // Continuation must build on the alternative.
+        if continuation.parent_id != alternative_tip.id {
+            return Err(ChainError::Reorg(
+                "continuation doesn't build on alternative".into(),
+            ));
+        }
+        if continuation.height != alternative_tip.height + 1 {
+            return Err(ChainError::NonSequentialHeight {
+                expected: alternative_tip.height + 1,
+                got: continuation.height,
+            });
+        }
+
+        // Pop old tip so validation runs against the correct chain state.
+        let old_tip = self.by_height.pop().unwrap();
+        self.by_id.remove(&old_tip.id);
+
+        // Validate alternative against the parent (now the chain tip).
+        if let Err(e) = self.validate_reorg_header(&alternative_tip, verify_pow) {
+            self.restore_tip(old_tip);
+            return Err(e);
+        }
+
+        // Push alternative so continuation validation sees the correct chain.
+        self.by_id.insert(alternative_tip.id, alternative_tip.height);
+        self.by_height.push(alternative_tip);
+
+        // Validate continuation against the alternative (now the chain tip).
+        if let Err(e) = self.validate_reorg_header(&continuation, verify_pow) {
+            // Roll back: pop alternative, restore old tip.
+            let alt = self.by_height.pop().unwrap();
+            self.by_id.remove(&alt.id);
+            self.restore_tip(old_tip);
+            return Err(e);
+        }
+
+        // Push continuation.
+        self.by_id.insert(continuation.id, continuation.height);
+        self.by_height.push(continuation);
+
+        Ok(old_tip.id)
+    }
+
+    /// Validate a header against the current tip during a reorg operation.
+    /// Same checks as `validate_child` but factored out to share between
+    /// alternative and continuation validation.
+    fn validate_reorg_header(&self, header: &Header, verify_pow: bool) -> Result<(), ChainError> {
+        let tip = self.by_height.last().expect("validate_reorg_header called on non-empty chain");
+
+        if header.timestamp <= tip.timestamp {
+            return Err(ChainError::TimestampNotIncreasing {
+                parent_ts: tip.timestamp,
+                got: header.timestamp,
+            });
+        }
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        if header.timestamp > now_ms + self.config.max_time_drift_ms {
+            return Err(ChainError::TimestampTooFarInFuture {
+                timestamp: header.timestamp,
+                max_allowed: now_ms + self.config.max_time_drift_ms,
+            });
+        }
+
+        let expected_n_bits = crate::difficulty::expected_difficulty(tip, self)?;
+        if header.n_bits != expected_n_bits {
+            return Err(ChainError::WrongDifficulty {
+                height: header.height,
+                expected: expected_n_bits,
+                got: header.n_bits,
+            });
+        }
+
+        if verify_pow {
+            crate::verify_pow(header)?;
+        }
+
+        Ok(())
+    }
+
+    /// Restore a popped tip header back onto the chain.
+    fn restore_tip(&mut self, header: Header) {
+        self.by_id.insert(header.id, header.height);
+        self.by_height.push(header);
     }
 
     // --- Test support ---

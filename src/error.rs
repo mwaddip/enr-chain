@@ -53,6 +53,10 @@ pub enum ChainError {
     #[error("difficulty calculation error: {0}")]
     DifficultyCalc(String),
 
+    /// Reorg precondition violated.
+    #[error("reorg error: {0}")]
+    Reorg(String),
+
     /// SyncInfo message is malformed or violates constraints.
     #[error("SyncInfo error: {0}")]
     SyncInfo(String),
