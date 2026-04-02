@@ -1,7 +1,8 @@
 use ergo_chain_types::blake2b256_hash;
 use ergo_chain_types::Header;
 
-/// Block section type IDs (modifier types for non-header block parts).
+/// Modifier type IDs for block sections.
+pub const HEADER_TYPE_ID: u8 = 101;
 pub const BLOCK_TRANSACTIONS_TYPE_ID: u8 = 102;
 pub const AD_PROOFS_TYPE_ID: u8 = 104;
 pub const EXTENSION_TYPE_ID: u8 = 108;
