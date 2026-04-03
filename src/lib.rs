@@ -18,6 +18,7 @@ mod tracker;
 
 pub use chain::{AppendResult, HeaderChain};
 pub use config::ChainConfig;
+pub use ergo_chain_types::autolykos_pow_scheme::decode_compact_bits;
 pub use ergo_chain_types::{BlockId, Header};
 pub use error::ChainError;
 pub use pow::verify_pow;
