@@ -10,6 +10,7 @@ pub(crate) mod difficulty;
 mod error;
 mod pow;
 mod section;
+mod state_type;
 mod sync_info;
 #[cfg(test)]
 mod tests;
@@ -20,7 +21,11 @@ pub use config::ChainConfig;
 pub use ergo_chain_types::{BlockId, Header};
 pub use error::ChainError;
 pub use pow::verify_pow;
-pub use section::{section_ids, HEADER_TYPE_ID, BLOCK_TRANSACTIONS_TYPE_ID, AD_PROOFS_TYPE_ID, EXTENSION_TYPE_ID};
+pub use section::{
+    required_section_ids, section_ids,
+    HEADER_TYPE_ID, BLOCK_TRANSACTIONS_TYPE_ID, AD_PROOFS_TYPE_ID, EXTENSION_TYPE_ID,
+};
+pub use state_type::StateType;
 pub use sync_info::{build_sync_info, parse_sync_info, SyncInfo};
 pub use tracker::HeaderTracker;
 

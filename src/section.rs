@@ -1,6 +1,8 @@
 use ergo_chain_types::blake2b256_hash;
 use ergo_chain_types::Header;
 
+use crate::state_type::StateType;
+
 /// Modifier type IDs for block sections.
 pub const HEADER_TYPE_ID: u8 = 101;
 pub const BLOCK_TRANSACTIONS_TYPE_ID: u8 = 102;
@@ -12,13 +14,31 @@ pub const EXTENSION_TYPE_ID: u8 = 108;
 /// Returns `[(type_id, modifier_id); 3]` for BlockTransactions, ADProofs,
 /// and Extension. Each modifier ID is `Blake2b256(type_id || header.id || section_root)`.
 ///
-/// Matches JVM `NonHeaderBlockSection.computeId(typeId, headerId, digest)`.
+/// Matches JVM `Header.sectionIds`. For mode-filtered sections, use
+/// [`required_section_ids`] instead.
 pub fn section_ids(header: &Header) -> [(u8, [u8; 32]); 3] {
     [
         (BLOCK_TRANSACTIONS_TYPE_ID, prefixed_hash(BLOCK_TRANSACTIONS_TYPE_ID, &header.id.0 .0, &header.transaction_root.0)),
         (AD_PROOFS_TYPE_ID, prefixed_hash(AD_PROOFS_TYPE_ID, &header.id.0 .0, &header.ad_proofs_root.0)),
         (EXTENSION_TYPE_ID, prefixed_hash(EXTENSION_TYPE_ID, &header.id.0 .0, &header.extension_root.0)),
     ]
+}
+
+/// Block sections required for a given header and node state type.
+///
+/// Mirrors JVM's `ToDownloadProcessor.requiredModifiersForHeader`:
+/// - UTXO mode → `sectionIdsWithNoProof` (BlockTransactions + Extension)
+/// - Digest mode → `sectionIds` (all three including ADProofs)
+pub fn required_section_ids(header: &Header, state_type: StateType) -> Vec<(u8, [u8; 32])> {
+    let all = section_ids(header);
+    if state_type.requires_proofs() {
+        all.to_vec()
+    } else {
+        all.iter()
+            .filter(|(type_id, _)| *type_id != AD_PROOFS_TYPE_ID)
+            .copied()
+            .collect()
+    }
 }
 
 /// `Blake2b256(prefix_byte || data1 || data2)` — mirrors Scorex `Algos.hash.prefixedHash`.
