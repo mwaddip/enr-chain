@@ -501,14 +501,14 @@ mod chain_tests {
     }
 
     #[test]
-    fn reject_duplicate_header() {
-        // A header already in the chain must not be accepted again.
+    fn duplicate_header_returns_forked() {
+        // A duplicate of an existing header has a parent in the chain but
+        // not at the tip — try_append returns Forked, not an error.
         let config = testnet_config();
         let mut chain = HeaderChain::new(config.clone());
         let genesis = make_genesis(&config);
         chain.try_append_no_pow(genesis).unwrap();
 
-        // Build a chain of 10 headers
         for h in 2..=10 {
             let tip = chain.tip();
             let expected_n_bits = crate::difficulty::expected_difficulty(tip, &chain).unwrap();
@@ -516,22 +516,21 @@ mod chain_tests {
             chain.try_append_no_pow(header).unwrap();
         }
 
-        // Try to append a clone of the header at height 5
         let existing = chain.header_at(5).unwrap().clone();
-        let result = chain.try_append_no_pow(existing);
-        assert!(result.is_err(), "duplicate header should be rejected");
+        let result = chain.try_append_no_pow(existing).unwrap();
+        assert!(matches!(result, crate::AppendResult::Forked { fork_height: 4 }));
+        assert_eq!(chain.height(), 10, "chain should be unchanged");
     }
 
     #[test]
-    fn reject_header_extending_non_tip() {
+    fn header_extending_non_tip_returns_forked() {
         // A header whose parent exists in the chain but is not the tip
-        // must be rejected — the chain is linear.
+        // returns Forked — the chain is unchanged.
         let config = testnet_config();
         let mut chain = HeaderChain::new(config.clone());
         let genesis = make_genesis(&config);
         chain.try_append_no_pow(genesis).unwrap();
 
-        // Build chain to height 10
         for h in 2..=10 {
             let tip = chain.tip();
             let expected_n_bits = crate::difficulty::expected_difficulty(tip, &chain).unwrap();
@@ -539,11 +538,11 @@ mod chain_tests {
             chain.try_append_no_pow(header).unwrap();
         }
 
-        // Build a valid-looking child of height-5 header (not the tip)
         let mid_header = chain.header_at(5).unwrap();
         let fork_child = make_chain_header(6, mid_header.id, mid_header.timestamp + 1000, config.initial_n_bits);
-        let result = chain.try_append_no_pow(fork_child);
-        assert!(result.is_err(), "header extending non-tip should be rejected");
+        let result = chain.try_append_no_pow(fork_child).unwrap();
+        assert!(matches!(result, crate::AppendResult::Forked { fork_height: 5 }));
+        assert_eq!(chain.height(), 10, "chain should be unchanged");
     }
 
     #[test]
@@ -1164,7 +1163,6 @@ mod section_tests {
         );
     }
 
-    /// Section IDs are deterministic — same header produces same IDs.
     #[test]
     fn section_ids_deterministic() {
         let json = r#"{"extensionId":"277907e4e5e42f27e928e6101cc4fec173bee5d7728794b73d7448c339c380e5","difficulty":"1325481984","votes":"000000","timestamp":1611225263165,"size":219,"stateRoot":"c0d0b5eafd07b22487dac66628669c42a242b90bef3e1fcdc76d83140d58b6bc0e","height":2870,"nBits":72286528,"version":2,"id":"5b0ce6711de6b926f60b67040cc4512804517785df375d063f1bf1d75588af3a","adProofsRoot":"49453875a43035c7640dee2f905efe06128b00d41acd2c8df13691576d4fd85c","transactionsRoot":"770cbb6e18673ed025d386487f15d3252115d9a6f6c9b947cf3d04731dd6ab75","extensionHash":"9bc7d54583c5d44bb62a7be0473cd78d601822a626afc13b636f2cbff0d87faf","powSolutions":{"pk":"0288114b0586efea9f86e4587f2071bc1c85fb77e15eba96b2769733e0daf57903","w":"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","n":"000100000580a91b","d":0},"adProofsId":"4fc36d59bf26a672e01fbfde1445bd66f50e0f540f24102e1e27d0be1a99dfbf","transactionsId":"d196ef8a7ef582ab1fdab4ef807715183705301c6ae2ff0dcbe8f1d577ba081f","parentId":"ab19e6c7a4062979dddb534df83f236d1b949c7cef18bcf434a67e87c593eef9"}"#;
@@ -1173,5 +1171,252 @@ mod section_tests {
         let ids1 = section_ids(&header);
         let ids2 = section_ids(&header);
         assert_eq!(ids1, ids2);
+    }
+}
+
+#[cfg(test)]
+mod score_and_deep_reorg_tests {
+    use crate::{AppendResult, ChainConfig, HeaderChain};
+    use ergo_chain_types::*;
+    use num_bigint::BigUint;
+    use sigma_ser::ScorexSerializable;
+
+    fn make_chain_header(
+        height: u32,
+        parent_id: BlockId,
+        timestamp: u64,
+        n_bits: u32,
+    ) -> Header {
+        make_chain_header_with_nonce(height, parent_id, timestamp, n_bits, height.to_be_bytes().repeat(2))
+    }
+
+    fn make_chain_header_with_nonce(
+        height: u32,
+        parent_id: BlockId,
+        timestamp: u64,
+        n_bits: u32,
+        nonce: Vec<u8>,
+    ) -> Header {
+        let zero32 = Digest32::zero();
+        let mut header = Header {
+            version: 2,
+            id: BlockId(Digest32::zero()),
+            parent_id,
+            ad_proofs_root: zero32,
+            state_root: ADDigest::zero(),
+            transaction_root: zero32,
+            timestamp,
+            n_bits,
+            height,
+            extension_root: zero32,
+            autolykos_solution: AutolykosSolution {
+                miner_pk: Box::new(EcPoint::default()),
+                pow_onetime_pk: None,
+                nonce,
+                pow_distance: None,
+            },
+            votes: Votes([0, 0, 0]),
+            unparsed_bytes: Box::new([]),
+        };
+        let bytes = header.scorex_serialize_bytes().unwrap();
+        let reparsed = Header::scorex_parse_bytes(&bytes).unwrap();
+        header.id = reparsed.id;
+        header
+    }
+
+    fn testnet_config() -> ChainConfig {
+        ChainConfig::testnet()
+    }
+
+    fn make_genesis(config: &ChainConfig) -> Header {
+        make_chain_header(1, BlockId(Digest32::zero()), 1_000_000, config.initial_n_bits)
+    }
+
+    fn build_test_chain(count: u32) -> HeaderChain {
+        let config = testnet_config();
+        let mut chain = HeaderChain::new(config.clone());
+        if count == 0 {
+            return chain;
+        }
+        let genesis = make_genesis(&config);
+        chain.try_append_no_pow(genesis).unwrap();
+        for h in 2..=count {
+            let tip = chain.tip();
+            let expected_n_bits = crate::difficulty::expected_difficulty(tip, &chain).unwrap();
+            let header = make_chain_header(h, tip.id, 1_000_000 + (h as u64 - 1) * 45_000, expected_n_bits);
+            chain.try_append_no_pow(header).unwrap();
+        }
+        chain
+    }
+
+    // --- Cumulative score tests ---
+
+    #[test]
+    fn cumulative_score_empty_chain_is_zero() {
+        let chain = build_test_chain(0);
+        assert_eq!(chain.cumulative_score(), BigUint::ZERO);
+    }
+
+    #[test]
+    fn cumulative_score_increases_on_append() {
+        let chain = build_test_chain(5);
+        let score = chain.cumulative_score();
+        assert!(score > BigUint::ZERO, "score should be positive after appending headers");
+        // Each header contributes decode_compact_bits(n_bits). With constant n_bits,
+        // the score should be n * difficulty.
+        let score_at_1 = chain.score_at(1).unwrap().clone();
+        let score_at_5 = chain.score_at(5).unwrap().clone();
+        assert!(score_at_5 > score_at_1);
+    }
+
+    #[test]
+    fn score_at_returns_none_for_empty_chain() {
+        let chain = build_test_chain(0);
+        assert!(chain.score_at(1).is_none());
+    }
+
+    #[test]
+    fn score_at_returns_none_for_out_of_range() {
+        let chain = build_test_chain(5);
+        assert!(chain.score_at(100).is_none());
+    }
+
+    // --- AppendResult tests ---
+
+    #[test]
+    fn try_append_returns_extended_for_tip_child() {
+        let config = testnet_config();
+        let mut chain = HeaderChain::new(config.clone());
+        let genesis = make_genesis(&config);
+        let result = chain.try_append_no_pow(genesis).unwrap();
+        assert!(matches!(result, AppendResult::Extended));
+    }
+
+    #[test]
+    fn try_append_returns_forked_for_non_tip_parent() {
+        let mut chain = build_test_chain(10);
+        let mid = chain.header_at(5).unwrap();
+        let fork_header = make_chain_header(6, mid.id, mid.timestamp + 1000, mid.n_bits);
+        let result = chain.try_append_no_pow(fork_header).unwrap();
+        assert!(matches!(result, AppendResult::Forked { fork_height: 5 }));
+    }
+
+    #[test]
+    fn try_append_forked_does_not_modify_chain() {
+        let mut chain = build_test_chain(10);
+        let original_height = chain.height();
+        let original_tip_id = chain.tip().id;
+        let original_score = chain.cumulative_score();
+
+        let mid = chain.header_at(5).unwrap();
+        let fork_header = make_chain_header(6, mid.id, mid.timestamp + 1000, mid.n_bits);
+        let _ = chain.try_append_no_pow(fork_header).unwrap();
+
+        assert_eq!(chain.height(), original_height);
+        assert_eq!(chain.tip().id, original_tip_id);
+        assert_eq!(chain.cumulative_score(), original_score);
+    }
+
+    // --- Deep reorg tests ---
+
+    #[test]
+    fn try_reorg_deep_switches_to_longer_fork() {
+        // Build chain [1, 2, 3, 4] (tip at 4).
+        // Create a new branch from genesis: [2', 3', 4', 5'] — longer fork.
+        let mut chain = build_test_chain(4);
+        let n_bits = chain.tip().n_bits;
+        let genesis_id = chain.header_at(1).unwrap().id;
+        let genesis_ts = chain.header_at(1).unwrap().timestamp;
+
+        // Build alternative branch from height 1 (genesis)
+        let mut alt_branch = Vec::new();
+        let mut prev_id = genesis_id;
+        for h in 2..=5 {
+            let header = make_chain_header_with_nonce(
+                h, prev_id, genesis_ts + (h as u64) * 50_000, n_bits,
+                vec![0xAA; 8],
+            );
+            prev_id = header.id;
+            alt_branch.push(header);
+        }
+
+        let demoted = chain.try_reorg_deep_no_pow(1, alt_branch.clone()).unwrap();
+
+        assert_eq!(demoted.len(), 3); // heights 2, 3, 4 were demoted
+        assert_eq!(chain.height(), 5);
+        assert_eq!(chain.len(), 5);
+        assert_eq!(chain.header_at(2).unwrap().id, alt_branch[0].id);
+        assert_eq!(chain.header_at(5).unwrap().id, alt_branch[3].id);
+    }
+
+    #[test]
+    fn try_reorg_deep_rolls_back_on_validation_failure() {
+        // Build chain [1, 2, 3, 4, 5].
+        // New branch has a bad header (wrong timestamp at position 2).
+        let mut chain = build_test_chain(5);
+        let original_height = chain.height();
+        let original_tip_id = chain.tip().id;
+        let original_score = chain.cumulative_score();
+        let n_bits = chain.tip().n_bits;
+        let genesis_id = chain.header_at(1).unwrap().id;
+        let genesis_ts = chain.header_at(1).unwrap().timestamp;
+
+        // First header is valid, second has timestamp <= first (invalid)
+        let h2 = make_chain_header_with_nonce(2, genesis_id, genesis_ts + 50_000, n_bits, vec![0xBB; 8]);
+        let h3_bad = make_chain_header_with_nonce(3, h2.id, genesis_ts + 10_000, n_bits, vec![0xBB; 8]); // ts goes backwards
+
+        let result = chain.try_reorg_deep_no_pow(1, vec![h2, h3_bad]);
+        assert!(result.is_err());
+        assert_eq!(chain.height(), original_height);
+        assert_eq!(chain.tip().id, original_tip_id);
+        assert_eq!(chain.cumulative_score(), original_score);
+    }
+
+    #[test]
+    fn try_reorg_deep_rejects_empty_branch() {
+        let mut chain = build_test_chain(5);
+        let result = chain.try_reorg_deep_no_pow(1, vec![]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn try_reorg_deep_rejects_wrong_parent() {
+        // First header doesn't connect to the fork point.
+        let mut chain = build_test_chain(5);
+        let n_bits = chain.tip().n_bits;
+
+        let bad = make_chain_header(2, BlockId(Digest32::from([0xDD; 32])), 2_000_000, n_bits);
+        let result = chain.try_reorg_deep_no_pow(1, vec![bad]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn try_reorg_deep_updates_scores() {
+        // After reorg, cumulative_score reflects the new branch.
+        let mut chain = build_test_chain(4);
+        let n_bits = chain.tip().n_bits;
+        let genesis_id = chain.header_at(1).unwrap().id;
+        let genesis_ts = chain.header_at(1).unwrap().timestamp;
+        let score_before = chain.cumulative_score();
+
+        // Build a 5-header branch (longer → higher score with same difficulty).
+        let mut alt_branch = Vec::new();
+        let mut prev_id = genesis_id;
+        for h in 2..=6 {
+            let header = make_chain_header_with_nonce(
+                h, prev_id, genesis_ts + (h as u64) * 50_000, n_bits,
+                vec![0xCC; 8],
+            );
+            prev_id = header.id;
+            alt_branch.push(header);
+        }
+
+        chain.try_reorg_deep_no_pow(1, alt_branch).unwrap();
+        let score_after = chain.cumulative_score();
+
+        // New branch has 5 blocks above genesis vs 3 before → higher score.
+        assert!(score_after > score_before);
+        // Score at fork point should be unchanged.
+        assert!(chain.score_at(1).is_some());
     }
 }

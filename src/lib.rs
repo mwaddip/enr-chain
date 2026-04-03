@@ -16,7 +16,7 @@ mod sync_info;
 mod tests;
 mod tracker;
 
-pub use chain::HeaderChain;
+pub use chain::{AppendResult, HeaderChain};
 pub use config::ChainConfig;
 pub use ergo_chain_types::{BlockId, Header};
 pub use error::ChainError;
@@ -27,6 +27,7 @@ pub use section::{
 };
 pub use state_type::StateType;
 pub use sync_info::{build_sync_info, parse_sync_info, SyncInfo};
+pub use num_bigint::BigUint;
 pub use tracker::HeaderTracker;
 
 use sigma_ser::ScorexSerializable;
