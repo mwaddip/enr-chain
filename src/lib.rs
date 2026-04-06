@@ -8,6 +8,7 @@ mod chain;
 mod config;
 pub(crate) mod difficulty;
 mod error;
+mod nipopow_proof;
 mod pow;
 mod section;
 mod state_type;
@@ -15,6 +16,7 @@ mod sync_info;
 #[cfg(test)]
 mod tests;
 mod tracker;
+mod voting;
 
 pub use chain::{AppendResult, HeaderChain};
 pub use config::ChainConfig;
@@ -30,6 +32,13 @@ pub use state_type::StateType;
 pub use sync_info::{build_sync_info, parse_sync_info, SyncInfo};
 pub use num_bigint::BigUint;
 pub use tracker::HeaderTracker;
+pub use nipopow_proof::{build_nipopow_proof, verify_nipopow_proof_bytes, NipopowProofMeta};
+pub use voting::{
+    pack_extension_bytes, pack_parameters_to_kv, parse_extension_bytes,
+    parse_parameters_from_kv, VotingConfig,
+    ID_BLOCK_VERSION, ID_SOFT_FORK_DISABLING_RULES, ID_SOFT_FORK_STARTING_HEIGHT,
+    ID_SOFT_FORK_VOTES_COLLECTED, SOFT_FORK_VOTE,
+};
 
 use sigma_ser::ScorexSerializable;
 

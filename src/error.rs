@@ -60,4 +60,16 @@ pub enum ChainError {
     /// SyncInfo message is malformed or violates constraints.
     #[error("SyncInfo error: {0}")]
     SyncInfo(String),
+
+    /// Voting / soft-fork state error.
+    #[error("voting error: {0}")]
+    Voting(String),
+
+    /// Extension parsing error.
+    #[error("extension parse error: {0}")]
+    ExtensionParse(String),
+
+    /// NiPoPoW proof error.
+    #[error("nipopow error: {0}")]
+    Nipopow(String),
 }

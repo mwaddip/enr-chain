@@ -1,3 +1,5 @@
+use crate::voting::VotingConfig;
+
 /// Network parameters that affect header chain validation.
 ///
 /// Determines epoch length, block interval, difficulty adjustment behavior,
@@ -20,6 +22,8 @@ pub struct ChainConfig {
     pub eip37_activation_height: Option<u32>,
     /// Epoch length after EIP-37 activation (mainnet: 128).
     pub eip37_epoch_length: Option<u32>,
+    /// Soft-fork voting parameters (Phase 6).
+    pub voting: VotingConfig,
 }
 
 impl ChainConfig {
@@ -33,6 +37,7 @@ impl ChainConfig {
             max_time_drift_ms: 10 * 45_000, // 450 seconds
             eip37_activation_height: None,
             eip37_epoch_length: None,
+            voting: VotingConfig::testnet(),
         }
     }
 
@@ -46,6 +51,7 @@ impl ChainConfig {
             max_time_drift_ms: 10 * 120_000, // 1200 seconds
             eip37_activation_height: Some(844_673),
             eip37_epoch_length: Some(128),
+            voting: VotingConfig::mainnet(),
         }
     }
 
