@@ -302,11 +302,18 @@ impl HeaderChain {
         let parsed = crate::voting::parse_parameters_from_kv(&fields)?;
 
         // Build a Parameters table from the parsed kv. Start from network
-        // defaults and override with any parsed entries.
+        // defaults and override with any parsed entries. Note that
+        // `default_parameters(Testnet)` already includes
+        // `SubblocksPerBlock = 30`; the explicit branch below will overwrite
+        // it with whatever the on-chain extension carried.
         let mut new_params = default_parameters(self.config.network);
         for (signed_id, value) in parsed {
             if let Some(p) = ordinary_param(signed_id) {
                 new_params.parameters_table.insert(p, value);
+            } else if signed_id == crate::voting::ID_SUBBLOCKS_PER_BLOCK {
+                new_params
+                    .parameters_table
+                    .insert(Parameter::SubblocksPerBlock, value);
             } else if signed_id == crate::voting::ID_BLOCK_VERSION {
                 new_params
                     .parameters_table
@@ -320,8 +327,6 @@ impl HeaderChain {
                     .parameters_table
                     .insert(Parameter::SoftForkStartingHeight, value);
             }
-            // FIXME-PHASE-B: extract Parameter::SubblocksPerBlock (id 9)
-            // here once the variant lands in sigma-rust.
         }
 
         // Extract SoftForkDisablingRules (ID 124) raw bytes if present.
@@ -492,6 +497,35 @@ impl HeaderChain {
                     .parameters_table
                     .insert(Parameter::BlockVersion, 2);
             }
+        }
+
+        // Step 4: auto-insert SubblocksPerBlock at BlockVersion == 4.
+        //
+        // Mirrors JVM `Parameters.scala::update` (~line 93): when the
+        // protocol reaches v4 (the 6.0 soft-fork that introduces sub-blocks)
+        // and `SubblocksPerBlock` is not yet present in the table, insert it
+        // with the default value (30).
+        //
+        // TODO: JVM additionally guards this with `!disablingRules.contains(409)`,
+        // where rule 409 enforces that all parameters in the extension match
+        // a known schema. We do NOT track per-rule disabling state; we only
+        // store the raw `active_disabling_rules` bytes (ID 124) for the
+        // byte-for-byte epoch-boundary comparison. As long as rule 409 is
+        // never voted-disabled on testnet/mainnet, this is consensus-correct.
+        // If rule 409 is ever voted disabled, this auto-insert becomes wrong.
+        if new_params
+            .parameters_table
+            .get(&Parameter::BlockVersion)
+            .copied()
+            == Some(4)
+            && !new_params
+                .parameters_table
+                .contains_key(&Parameter::SubblocksPerBlock)
+        {
+            new_params.parameters_table.insert(
+                Parameter::SubblocksPerBlock,
+                crate::voting::SUBBLOCKS_PER_BLOCK_DEFAULT,
+            );
         }
 
         Ok(new_params)

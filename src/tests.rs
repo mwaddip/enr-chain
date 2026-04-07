@@ -2012,15 +2012,17 @@ mod voting_chain_tests {
     fn compute_expected_parameters_testnet_height_128_no_votes() {
         // Synthetic 128-header testnet chain with all-zero votes.
         // The expected parameters at boundary 128 should match the testnet
-        // ground-truth ordinary defaults + BlockVersion=4.
+        // ground-truth ordinary defaults + BlockVersion=4 + SubblocksPerBlock=30
+        // (auto-inserted by compute_expected_parameters at BlockVersion==4).
         //
-        // FIXME-PHASE-B: after rev bump enables Parameter::SubblocksPerBlock,
-        // also assert SubblocksPerBlock=30 is auto-inserted. The full
-        // testnet ground-truth at block 128 (per JVM /blocks/{id}/extension):
+        // The full testnet ground-truth at block 128 (per JVM /blocks/{id}/extension):
         //   StorageFeeFactor=1250000, MinValuePerByte=360, MaxBlockSize=524288,
         //   MaxBlockCost=1000000, TokenAccessCost=100, InputCost=2000,
         //   DataInputCost=100, OutputCost=100, SubblocksPerBlock=30,
         //   BlockVersion=4, SoftForkDisablingRules=02d701990300
+        // (SoftForkDisablingRules tracked separately on HeaderChain.)
+        use ergo_lib::chain::parameters::Parameter;
+
         let chain = build_chain_with_votes(128, [0, 0, 0]);
         let expected = chain.compute_expected_parameters(128).unwrap();
 
@@ -2033,5 +2035,49 @@ mod voting_chain_tests {
         assert_eq!(expected.data_input_cost(), 100);
         assert_eq!(expected.output_cost(), 100);
         assert_eq!(expected.block_version(), 4);
+        assert_eq!(
+            expected
+                .parameters_table
+                .get(&Parameter::SubblocksPerBlock)
+                .copied(),
+            Some(30),
+            "SubblocksPerBlock must be present at block_version=4"
+        );
+    }
+
+    #[test]
+    fn compute_expected_parameters_auto_inserts_subblocks_at_v4() {
+        // A chain whose active parameters are at BlockVersion==4 but somehow
+        // missing SubblocksPerBlock should have it auto-inserted by
+        // compute_expected_parameters at the next epoch boundary.
+        //
+        // Construction: start with default testnet (which already has the
+        // entry), strip it, then run compute. The output should reintroduce
+        // SubblocksPerBlock=30.
+        use ergo_lib::chain::parameters::Parameter;
+
+        let mut chain = build_chain_with_votes(128, [0, 0, 0]);
+        // Force-remove SubblocksPerBlock from the active parameters to
+        // simulate a chain that hasn't had it auto-inserted yet.
+        let mut stripped = chain.active_parameters().clone();
+        stripped.parameters_table.remove(&Parameter::SubblocksPerBlock);
+        assert!(
+            !stripped
+                .parameters_table
+                .contains_key(&Parameter::SubblocksPerBlock),
+            "precondition: stripped table must not contain SubblocksPerBlock"
+        );
+        chain.apply_epoch_boundary_parameters(stripped);
+
+        let expected = chain.compute_expected_parameters(128).unwrap();
+        assert_eq!(expected.block_version(), 4);
+        assert_eq!(
+            expected
+                .parameters_table
+                .get(&Parameter::SubblocksPerBlock)
+                .copied(),
+            Some(30),
+            "auto-insert at BlockVersion==4 must populate SubblocksPerBlock=30"
+        );
     }
 }

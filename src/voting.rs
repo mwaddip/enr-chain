@@ -26,6 +26,12 @@ use hashbrown::HashMap as HbHashMap;
 /// votes (1-8) which appear as the same byte in their dedicated slot.
 pub const SOFT_FORK_VOTE: i8 = 120;
 
+/// Param ID 9: number of sub-blocks per block, on average. Lives on
+/// [`Parameters`] as [`Parameter::SubblocksPerBlock`]. Introduced by the
+/// 6.0 soft-fork (block version 4); auto-inserted whenever the table
+/// reaches `BlockVersion == 4`.
+pub const ID_SUBBLOCKS_PER_BLOCK: i8 = 9;
+
 /// Reserved soft-fork state param IDs. Numeric values mirror JVM
 /// `Parameters.scala`. Stored directly in `parameters_table` via
 /// `Parameter::SoftForkVotesCollected` / `Parameter::SoftForkStartingHeight`
@@ -177,16 +183,17 @@ fn ordinary_param(id: i8) -> Option<Parameter> {
 /// post-6.0); mainnet started at v1 and progressed via voting. The
 /// `BlockVersion` default differs accordingly.
 ///
-/// **FIXME-PHASE-B**: testnet at v4 also requires `Parameter::SubblocksPerBlock = 30`
-/// per JVM `Parameters.scala::update`. That variant is being added in a
-/// follow-up sigma-rust commit; once the rev bumps, add the entry here
-/// and update the testnet ground-truth tests.
+/// Testnet additionally carries `Parameter::SubblocksPerBlock = 30` because
+/// JVM `Parameters.scala::update` auto-inserts it whenever `BlockVersion == 4`.
+/// Mainnet starts at v1 so it does NOT include the entry — it would be
+/// auto-inserted by [`crate::HeaderChain::compute_expected_parameters`] if
+/// mainnet ever activates protocol v4 via voting.
 pub fn default_parameters(network: crate::Network) -> Parameters {
     let block_version = match network {
         crate::Network::Mainnet => 1,
         crate::Network::Testnet => 4,
     };
-    Parameters::new(
+    let mut params = Parameters::new(
         block_version,
         1_250_000, // StorageFeeFactor
         360,       // MinValuePerByte (30 * 12)
@@ -196,8 +203,19 @@ pub fn default_parameters(network: crate::Network) -> Parameters {
         2_000,     // InputCost
         100,       // DataInputCost
         100,       // OutputCost
-    )
+    );
+    if matches!(network, crate::Network::Testnet) {
+        params
+            .parameters_table
+            .insert(Parameter::SubblocksPerBlock, SUBBLOCKS_PER_BLOCK_DEFAULT);
+    }
+    params
 }
+
+/// Default `SubblocksPerBlock` value (mirrors JVM
+/// `Parameters.SubblocksPerBlockDefault`). Auto-inserted whenever a
+/// `Parameters` table is constructed at protocol version 4 or higher.
+pub(crate) const SUBBLOCKS_PER_BLOCK_DEFAULT: i32 = 30;
 
 /// Apply a single ordinary parameter vote step to a parameters table.
 ///
@@ -523,6 +541,37 @@ mod tests {
     fn default_parameters_mainnet_starts_at_v1() {
         let p = default_parameters(crate::Network::Mainnet);
         assert_eq!(p.block_version(), 1);
+    }
+
+    #[test]
+    fn default_parameters_testnet_includes_subblocks() {
+        // Testnet starts at BlockVersion=4 and JVM Parameters.scala::update
+        // auto-inserts SubblocksPerBlock=30 whenever the table is at v4. The
+        // chain-internal startup default must reflect that, so any code that
+        // queries `params.parameters_table[&Parameter::SubblocksPerBlock]`
+        // before the first epoch boundary still finds the value.
+        let p = default_parameters(crate::Network::Testnet);
+        assert_eq!(
+            p.parameters_table
+                .get(&Parameter::SubblocksPerBlock)
+                .copied(),
+            Some(30),
+            "testnet defaults must include SubblocksPerBlock=30"
+        );
+    }
+
+    #[test]
+    fn default_parameters_mainnet_omits_subblocks() {
+        // Mainnet starts at BlockVersion=1 and only progresses to v4 via
+        // soft-fork voting. SubblocksPerBlock must NOT be present in the
+        // pre-v4 startup table — it gets auto-inserted by
+        // `compute_expected_parameters` once voting bumps the version.
+        let p = default_parameters(crate::Network::Mainnet);
+        assert!(
+            !p.parameters_table
+                .contains_key(&Parameter::SubblocksPerBlock),
+            "mainnet starts at v1 and must not have SubblocksPerBlock"
+        );
     }
 
     #[test]
