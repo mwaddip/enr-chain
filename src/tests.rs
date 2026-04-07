@@ -1578,9 +1578,14 @@ mod voting_chain_tests {
         let params = chain.active_parameters();
         // The default we provide is JVM-startup defaults — must include MaxBlockCost
         // (the upstream Default::default() omits it).
-        assert_eq!(params.block_version(), 1);
+        // Testnet starts at protocol v4 (post-6.0 testnet.conf).
+        assert_eq!(params.block_version(), 4);
         assert_eq!(params.storage_fee_factor(), 1_250_000);
         let _ = params.max_block_cost(); // Must not panic
+
+        // Mainnet still starts at v1
+        let mainnet_chain = HeaderChain::new(crate::ChainConfig::mainnet());
+        assert_eq!(mainnet_chain.active_parameters().block_version(), 1);
     }
 
     #[test]
@@ -1729,7 +1734,8 @@ mod voting_chain_tests {
             expected.storage_fee_factor(),
             chain.active_parameters().storage_fee_factor()
         );
-        assert_eq!(expected.block_version(), 1);
+        // Testnet starts at protocol v4 — unchanged when no votes are cast.
+        assert_eq!(expected.block_version(), 4);
     }
 
     #[test]
@@ -1762,8 +1768,8 @@ mod voting_chain_tests {
         }
 
         chain.recompute_active_parameters_from_storage().unwrap();
-        // Defaults preserved
-        assert_eq!(chain.active_parameters().block_version(), 1);
+        // Defaults preserved (testnet starts at v4)
+        assert_eq!(chain.active_parameters().block_version(), 4);
     }
 
     #[test]
@@ -1913,9 +1919,10 @@ mod voting_chain_tests {
         }
         // After voting period, BlockVersion has NOT changed yet (activation is later).
         // Soft-fork state has been accumulated in parameters_table.
+        // (Testnet starts at v4; this test exercises the lifecycle, not the bump-from-1 case.)
         assert_eq!(
             chain.active_parameters().block_version(),
-            1,
+            4,
             "BlockVersion only bumps at activation"
         );
         let votes = chain
@@ -1923,5 +1930,108 @@ mod voting_chain_tests {
             .soft_fork_votes_collected()
             .unwrap_or(0);
         assert!(votes > 0, "votes accumulated in parameters_table");
+    }
+
+    #[test]
+    fn active_disabling_rules_starts_empty() {
+        let chain = HeaderChain::new(testnet_config());
+        assert!(chain.active_disabling_rules().is_empty());
+    }
+
+    #[test]
+    fn apply_epoch_boundary_disabling_rules_round_trip() {
+        let mut chain = HeaderChain::new(testnet_config());
+        let bytes = vec![0x02, 0xD7, 0x01, 0x99, 0x03, 0x00];
+        chain.apply_epoch_boundary_disabling_rules(bytes.clone());
+        assert_eq!(chain.active_disabling_rules(), &bytes[..]);
+
+        // Clearing
+        chain.apply_epoch_boundary_disabling_rules(Vec::new());
+        assert!(chain.active_disabling_rules().is_empty());
+    }
+
+    #[test]
+    fn recompute_extracts_disabling_rules_from_extension() {
+        use crate::voting::{pack_extension_bytes, pack_parameters_to_kv};
+        use std::collections::HashMap;
+
+        let mut chain = HeaderChain::new(testnet_config());
+        let n_bits = chain.config().initial_n_bits;
+
+        // Build a chain past the first epoch boundary (height 128).
+        let mut prev = ergo_chain_types::BlockId(ergo_chain_types::Digest32::zero());
+        let g = make_header_with_votes(1, prev, 1_000_000, n_bits, [0, 0, 0]);
+        prev = g.id;
+        chain.try_append_no_pow(g).unwrap();
+        for h in 2..=130 {
+            let header = make_header_with_votes(
+                h, prev, 1_000_000 + (h as u64 - 1) * 45_000, n_bits, [0, 0, 0],
+            );
+            prev = header.id;
+            chain.try_append_no_pow(header).unwrap();
+        }
+
+        // Build extension with the testnet ground-truth disabling rules bytes.
+        let mut params: HashMap<i8, i32> = HashMap::new();
+        params.insert(1, 1_250_000);
+        params.insert(2, 360);
+        params.insert(3, 524_288);
+        params.insert(4, 1_000_000);
+        params.insert(5, 100);
+        params.insert(6, 2_000);
+        params.insert(7, 100);
+        params.insert(8, 100);
+        params.insert(123, 4);
+        let mut kv = pack_parameters_to_kv(&params);
+        // Add ID 124 (SoftForkDisablingRules) — variable-length value
+        let disabling_rules_bytes = vec![0x02, 0xD7, 0x01, 0x99, 0x03, 0x00];
+        kv.push(([0x00u8, 0x7C], disabling_rules_bytes.clone()));
+
+        let header_id = chain.header_at(128).unwrap().id;
+        let extension_bytes = pack_extension_bytes(&header_id, &kv);
+
+        chain.set_extension_loader(move |h| {
+            if h == 128 {
+                Some(extension_bytes.clone())
+            } else {
+                None
+            }
+        });
+
+        chain.recompute_active_parameters_from_storage().unwrap();
+        assert_eq!(
+            chain.active_disabling_rules(),
+            &disabling_rules_bytes[..],
+            "ID 124 bytes should round-trip from extension into active_disabling_rules"
+        );
+        // Block version is also restored
+        assert_eq!(chain.active_parameters().block_version(), 4);
+    }
+
+    #[test]
+    fn compute_expected_parameters_testnet_height_128_no_votes() {
+        // Synthetic 128-header testnet chain with all-zero votes.
+        // The expected parameters at boundary 128 should match the testnet
+        // ground-truth ordinary defaults + BlockVersion=4.
+        //
+        // FIXME-PHASE-B: after rev bump enables Parameter::SubblocksPerBlock,
+        // also assert SubblocksPerBlock=30 is auto-inserted. The full
+        // testnet ground-truth at block 128 (per JVM /blocks/{id}/extension):
+        //   StorageFeeFactor=1250000, MinValuePerByte=360, MaxBlockSize=524288,
+        //   MaxBlockCost=1000000, TokenAccessCost=100, InputCost=2000,
+        //   DataInputCost=100, OutputCost=100, SubblocksPerBlock=30,
+        //   BlockVersion=4, SoftForkDisablingRules=02d701990300
+        let chain = build_chain_with_votes(128, [0, 0, 0]);
+        let expected = chain.compute_expected_parameters(128).unwrap();
+
+        assert_eq!(expected.storage_fee_factor(), 1_250_000);
+        assert_eq!(expected.min_value_per_byte(), 360);
+        assert_eq!(expected.max_block_size(), 524_288);
+        assert_eq!(expected.max_block_cost(), 1_000_000);
+        assert_eq!(expected.token_access_cost(), 100);
+        assert_eq!(expected.input_cost(), 2_000);
+        assert_eq!(expected.data_input_cost(), 100);
+        assert_eq!(expected.output_cost(), 100);
+        assert_eq!(expected.block_version(), 4);
     }
 }

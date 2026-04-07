@@ -67,6 +67,14 @@ pub struct HeaderChain {
     /// `Parameter::SoftForkStartingHeight`. When voting is inactive, those
     /// keys are absent. This mirrors JVM `parametersTable` exactly.
     active_parameters: Parameters,
+    /// Variable-length encoding of `ErgoValidationSettingsUpdate` (param ID 124,
+    /// `SoftForkDisablingRules`) from the most recent epoch-boundary block's
+    /// extension. Empty when no disabling rules have been voted in.
+    ///
+    /// JVM stores this on `Parameters.proposedUpdate`, separate from
+    /// `parametersTable`. Sigma-rust does not yet expose this on its
+    /// `Parameters` type, so we track the raw bytes here on `HeaderChain`.
+    active_disabling_rules: Vec<u8>,
     /// Optional callback for loading extension bytes by height. Required
     /// before calling [`Self::recompute_active_parameters_from_storage`]
     /// or [`crate::nipopow_proof::build_nipopow_proof`].
@@ -88,12 +96,14 @@ fn header_difficulty(header: &Header) -> BigUint {
 impl HeaderChain {
     /// Create a new empty chain with the given network configuration.
     pub fn new(config: ChainConfig) -> Self {
+        let active_parameters = default_parameters(config.network);
         Self {
             config,
             by_height: Vec::new(),
             by_id: HashMap::new(),
             scores: Vec::new(),
-            active_parameters: default_parameters(),
+            active_parameters,
+            active_disabling_rules: Vec::new(),
             extension_loader: None,
         }
     }
@@ -291,9 +301,9 @@ impl HeaderChain {
         let (_header_id, fields) = crate::voting::parse_extension_bytes(&extension_bytes)?;
         let parsed = crate::voting::parse_parameters_from_kv(&fields)?;
 
-        // Build a Parameters table from the parsed kv. Start from defaults
-        // and override with any parsed entries.
-        let mut new_params = default_parameters();
+        // Build a Parameters table from the parsed kv. Start from network
+        // defaults and override with any parsed entries.
+        let mut new_params = default_parameters(self.config.network);
         for (signed_id, value) in parsed {
             if let Some(p) = ordinary_param(signed_id) {
                 new_params.parameters_table.insert(p, value);
@@ -310,10 +320,44 @@ impl HeaderChain {
                     .parameters_table
                     .insert(Parameter::SoftForkStartingHeight, value);
             }
+            // FIXME-PHASE-B: extract Parameter::SubblocksPerBlock (id 9)
+            // here once the variant lands in sigma-rust.
         }
 
+        // Extract SoftForkDisablingRules (ID 124) raw bytes if present.
+        // JVM stores this on Parameters.proposedUpdate, not parametersTable;
+        // we track it separately on HeaderChain.
+        let disabling_rules = crate::voting::extract_disabling_rules_from_kv(&fields);
+
         self.active_parameters = new_params;
+        self.active_disabling_rules = disabling_rules;
         Ok(())
+    }
+
+    /// Active `SoftForkDisablingRules` (ID 124) bytes from the most recent
+    /// epoch-boundary block's extension. Empty when no disabling rules
+    /// have been voted in.
+    ///
+    /// JVM stores this on `Parameters.proposedUpdate`. Sigma-rust does
+    /// not yet expose it on its `Parameters` type, so we track the raw
+    /// bytes here. The validator (in main repo) parses ID 124 from the
+    /// extension and the caller calls
+    /// [`Self::apply_epoch_boundary_disabling_rules`] after the block is
+    /// validated.
+    pub fn active_disabling_rules(&self) -> &[u8] {
+        &self.active_disabling_rules
+    }
+
+    /// Set the active disabling rules after a successful epoch-boundary block.
+    ///
+    /// **Precondition**: `bytes` were parsed from the just-validated
+    /// epoch-boundary block's extension (key `[0x00, 0x7C]` = ID 124).
+    /// Caller must have already verified the block via the validator.
+    ///
+    /// Should be called alongside [`Self::apply_epoch_boundary_parameters`]
+    /// at the same lifecycle point. Pass an empty `Vec` to clear.
+    pub fn apply_epoch_boundary_disabling_rules(&mut self, bytes: Vec<u8>) {
+        self.active_disabling_rules = bytes;
     }
 
     /// The blockchain parameters in effect at the current chain tip.

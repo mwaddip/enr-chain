@@ -19,7 +19,7 @@ mod tracker;
 mod voting;
 
 pub use chain::{AppendResult, HeaderChain};
-pub use config::ChainConfig;
+pub use config::{ChainConfig, Network};
 pub use ergo_chain_types::autolykos_pow_scheme::decode_compact_bits;
 pub use ergo_chain_types::{BlockId, Header};
 pub use error::ChainError;
@@ -34,8 +34,8 @@ pub use num_bigint::BigUint;
 pub use tracker::HeaderTracker;
 pub use nipopow_proof::{build_nipopow_proof, verify_nipopow_proof_bytes, NipopowProofMeta};
 pub use voting::{
-    pack_extension_bytes, pack_parameters_to_kv, parse_extension_bytes,
-    parse_parameters_from_kv, VotingConfig,
+    extract_disabling_rules_from_kv, pack_extension_bytes, pack_parameters_to_kv,
+    parse_extension_bytes, parse_parameters_from_kv, VotingConfig,
     ID_BLOCK_VERSION, ID_SOFT_FORK_DISABLING_RULES, ID_SOFT_FORK_STARTING_HEIGHT,
     ID_SOFT_FORK_VOTES_COLLECTED, SOFT_FORK_VOTE,
 };

@@ -1,11 +1,26 @@
 use crate::voting::VotingConfig;
 
+/// Network identity for the chain.
+///
+/// Determines starting parameters (block version, soft-fork activation
+/// state) that differ between deployments. Mainnet started at v1 and
+/// progressed via voting; testnet was created post-6.0 and starts at v4.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum Network {
+    /// Production network.
+    Mainnet,
+    /// Testnet (the post-6.0 incarnation, starts at protocol v4).
+    Testnet,
+}
+
 /// Network parameters that affect header chain validation.
 ///
 /// Determines epoch length, block interval, difficulty adjustment behavior,
 /// and whether EIP-37 applies. Passed to `HeaderChain` at construction.
 #[derive(Debug, Clone)]
 pub struct ChainConfig {
+    /// Network identity (selects starting parameter defaults).
+    pub network: Network,
     /// Blocks per difficulty epoch.
     pub epoch_length: u32,
     /// Target time between blocks, in milliseconds.
@@ -30,6 +45,7 @@ impl ChainConfig {
     /// Testnet configuration.
     pub fn testnet() -> Self {
         Self {
+            network: Network::Testnet,
             epoch_length: 128,
             block_interval_ms: 45_000,
             use_last_epochs: 8,
@@ -44,6 +60,7 @@ impl ChainConfig {
     /// Mainnet configuration.
     pub fn mainnet() -> Self {
         Self {
+            network: Network::Mainnet,
             epoch_length: 1024,
             block_interval_ms: 120_000,
             use_last_epochs: 8,

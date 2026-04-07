@@ -172,9 +172,22 @@ fn ordinary_param(id: i8) -> Option<Parameter> {
 /// pinned revision — it does NOT insert `MaxBlockCost`, so any code that
 /// reads `params.max_block_cost()` panics. We construct a complete default
 /// here, mirroring JVM `Parameters.scala` startup defaults.
-pub fn default_parameters() -> Parameters {
+///
+/// Network-aware: testnet starts at protocol v4 (testnet.conf was created
+/// post-6.0); mainnet started at v1 and progressed via voting. The
+/// `BlockVersion` default differs accordingly.
+///
+/// **FIXME-PHASE-B**: testnet at v4 also requires `Parameter::SubblocksPerBlock = 30`
+/// per JVM `Parameters.scala::update`. That variant is being added in a
+/// follow-up sigma-rust commit; once the rev bumps, add the entry here
+/// and update the testnet ground-truth tests.
+pub fn default_parameters(network: crate::Network) -> Parameters {
+    let block_version = match network {
+        crate::Network::Mainnet => 1,
+        crate::Network::Testnet => 4,
+    };
     Parameters::new(
-        1,         // BlockVersion
+        block_version,
         1_250_000, // StorageFeeFactor
         360,       // MinValuePerByte (30 * 12)
         524_288,   // MaxBlockSize (512 KiB)
@@ -253,6 +266,25 @@ pub fn parse_parameters_from_kv(
         out.insert(id, i32::from_be_bytes(buf));
     }
     Ok(out)
+}
+
+/// Extract the `SoftForkDisablingRules` (ID 124) raw bytes from extension
+/// key-value pairs, if present.
+///
+/// JVM stores ID 124 as a variable-length `ErgoValidationSettingsUpdate`
+/// encoding on `Parameters.proposedUpdate`, separate from `parametersTable`.
+/// We don't decode the structure here — we just preserve the bytes for
+/// the validator's byte-for-byte epoch-boundary comparison and for
+/// passing through to the next epoch's expected output.
+///
+/// Returns an empty `Vec` if no ID 124 entry is present.
+pub fn extract_disabling_rules_from_kv(kv: &[([u8; 2], Vec<u8>)]) -> Vec<u8> {
+    for (key, value) in kv {
+        if key[0] == 0x00 && (key[1] as i8) == ID_SOFT_FORK_DISABLING_RULES {
+            return value.clone();
+        }
+    }
+    Vec::new()
 }
 
 /// Pack a parameter table into extension key-value pairs.
@@ -461,10 +493,36 @@ mod tests {
     }
 
     #[test]
-    fn default_parameters_includes_max_block_cost() {
-        let p = default_parameters();
-        // The bug we're working around: Parameters::default() omits this.
+    fn default_parameters_mainnet_includes_max_block_cost() {
+        let p = default_parameters(crate::Network::Mainnet);
+        // The bug we're working around: Parameters::default() omits MaxBlockCost.
         let _ = p.max_block_cost();
+        assert_eq!(p.block_version(), 1);
+    }
+
+    #[test]
+    fn default_parameters_testnet_starts_at_v4() {
+        let p = default_parameters(crate::Network::Testnet);
+        assert_eq!(
+            p.block_version(),
+            4,
+            "testnet was created post-6.0 and starts at protocol v4"
+        );
+        // Ordinary defaults match mainnet
+        assert_eq!(p.storage_fee_factor(), 1_250_000);
+        assert_eq!(p.min_value_per_byte(), 360);
+        assert_eq!(p.max_block_size(), 524_288);
+        assert_eq!(p.max_block_cost(), 1_000_000);
+        assert_eq!(p.token_access_cost(), 100);
+        assert_eq!(p.input_cost(), 2_000);
+        assert_eq!(p.data_input_cost(), 100);
+        assert_eq!(p.output_cost(), 100);
+    }
+
+    #[test]
+    fn default_parameters_mainnet_starts_at_v1() {
+        let p = default_parameters(crate::Network::Mainnet);
+        assert_eq!(p.block_version(), 1);
     }
 
     #[test]
