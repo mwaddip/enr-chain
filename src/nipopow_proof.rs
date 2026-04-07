@@ -94,6 +94,45 @@ pub fn build_nipopow_proof(
             })?
             .clone();
 
+        // Genesis (h=1) special case: per the contract in `facts/chain.md`
+        // (Phase 6 → `build_nipopow_proof`), the genesis block's interlinks
+        // vector is canonical (`[genesis_block_id]`) and MUST NOT be read
+        // from the loader. Real testnet/mainnet genesis extensions have
+        // `fields = []` (empty merkle root `0e5751c0...`), so calling the
+        // loader and unpacking would yield empty interlinks — wrong by
+        // convention and produces a malformed proof. We synthesize the
+        // genesis `PoPowHeader` in-process instead, mirroring the JVM
+        // node's `popowHeader(genesis_id)` path.
+        if h == 1 {
+            let interlinks = vec![header.id];
+            // Build a synthetic ExtensionCandidate from the canonical
+            // packed-interlinks bytes and feed it through the same merkle
+            // proof helper used for non-genesis heights. This guarantees
+            // byte-identical equivalence with the JVM's
+            // `NipopowAlgos.proofForInterlinkVector` output for the same
+            // inputs.
+            let synthetic_ext = ExtensionCandidate::new(
+                NipopowAlgos::pack_interlinks(interlinks.clone()),
+            )
+            .map_err(|e| {
+                ChainError::Nipopow(format!(
+                    "synthetic genesis ExtensionCandidate::new failed: {e}"
+                ))
+            })?;
+            let interlinks_proof = NipopowAlgos::proof_for_interlink_vector(&synthetic_ext)
+                .ok_or_else(|| {
+                    ChainError::Nipopow(
+                        "synthetic genesis proof_for_interlink_vector returned None".into(),
+                    )
+                })?;
+            popow_headers.push(PoPowHeader {
+                header,
+                interlinks,
+                interlinks_proof,
+            });
+            continue;
+        }
+
         let ext_bytes = loader(h).ok_or_else(|| {
             ChainError::Nipopow(format!("extension at height {h} missing from loader"))
         })?;
@@ -248,6 +287,16 @@ mod tests {
     /// store containing interlink fields. Returns the chain (with loader
     /// already wired) and the synthetic store.
     fn build_chain_with_interlinks(count: u32) -> HeaderChain {
+        build_chain_with_interlinks_opts(count, true)
+    }
+
+    /// Like [`build_chain_with_interlinks`] but caller controls whether the
+    /// genesis (h=1) extension bytes are inserted into the loader's backing
+    /// store. Setting `include_genesis_in_loader = false` produces a chain
+    /// whose loader returns `None` for h=1 — used to verify that
+    /// `build_nipopow_proof` synthesizes the genesis `PoPowHeader` in-process
+    /// rather than querying the loader.
+    fn build_chain_with_interlinks_opts(count: u32, include_genesis_in_loader: bool) -> HeaderChain {
         let config = ChainConfig::testnet();
         let mut chain = HeaderChain::new(config.clone());
         let n_bits = config.initial_n_bits;
@@ -293,6 +342,9 @@ mod tests {
         let mut store: std::collections::HashMap<u32, Vec<u8>> =
             std::collections::HashMap::new();
         for (idx, h) in headers.iter().enumerate() {
+            if h.height == 1 && !include_genesis_in_loader {
+                continue;
+            }
             let interlinks_for_h = &interlinks[idx];
             let fields = NipopowAlgos::pack_interlinks(interlinks_for_h.clone());
             let bytes = pack_extension_bytes(&h.id, &fields);
@@ -375,6 +427,30 @@ mod tests {
     fn verify_garbage_bytes_errors() {
         let r = verify_nipopow_proof_bytes(&[0xFFu8; 32]);
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn build_proof_skips_loader_for_genesis() {
+        // Loader has bytes for h>=2 only — pre-fix this fails with
+        // "extension at height 1 missing from loader" because the impl
+        // unconditionally queries the loader for every height. Post-fix the
+        // genesis PoPowHeader is synthesized in-process and the loader is
+        // never asked for h=1.
+        let chain = build_chain_with_interlinks_opts(20, false);
+        let bytes = build_nipopow_proof(&chain, 2, 2, None)
+            .expect("build must succeed without genesis loader entry");
+        assert!(!bytes.is_empty());
+    }
+
+    #[test]
+    fn build_then_verify_synth_genesis_roundtrip() {
+        // Same chain shape: loader returns None for h=1. The proof must
+        // build, serialize, and round-trip back through the verifier.
+        let chain = build_chain_with_interlinks_opts(20, false);
+        let bytes = build_nipopow_proof(&chain, 2, 2, None).expect("build");
+        let meta = verify_nipopow_proof_bytes_no_pow(&bytes).expect("verify");
+        assert!(meta.total_headers >= 4); // m + k = 4
+        assert_eq!(meta.suffix_tip_height, 20);
     }
 
     #[test]
