@@ -29,15 +29,18 @@ pub fn section_ids(header: &Header) -> [(u8, [u8; 32]); 3] {
 /// Mirrors JVM's `ToDownloadProcessor.requiredModifiersForHeader`:
 /// - UTXO mode → `sectionIdsWithNoProof` (BlockTransactions + Extension)
 /// - Digest mode → `sectionIds` (all three including ADProofs)
+/// - Light mode → empty Vec; light clients download no block sections.
+///   Returning empty here lets sync's section-queue construction handle
+///   `Light` without a special case at the call site.
 pub fn required_section_ids(header: &Header, state_type: StateType) -> Vec<(u8, [u8; 32])> {
-    let all = section_ids(header);
-    if state_type.requires_proofs() {
-        all.to_vec()
-    } else {
-        all.iter()
+    match state_type {
+        StateType::Light => Vec::new(),
+        StateType::Digest => section_ids(header).to_vec(),
+        StateType::Utxo => section_ids(header)
+            .iter()
             .filter(|(type_id, _)| *type_id != AD_PROOFS_TYPE_ID)
             .copied()
-            .collect()
+            .collect(),
     }
 }
 

@@ -2081,3 +2081,388 @@ mod voting_chain_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod light_client_install_tests {
+    //! Tests for `install_from_nipopow_proof`, `light_client_mode`, and
+    //! `reorg_floor` (Phase 6 light-client install API).
+    //!
+    //! Synthetic-header tests use the `_no_pow` install variant since the
+    //! real Autolykos solutions are not present on these fixtures. The PoW
+    //! path is exercised by integration tests against real chains in the
+    //! main crate.
+
+    use crate::{AppendResult, ChainConfig, ChainError, HeaderChain};
+    use ergo_chain_types::*;
+    use sigma_ser::ScorexSerializable;
+
+    fn make_chain_header(
+        height: u32,
+        parent_id: BlockId,
+        timestamp: u64,
+        n_bits: u32,
+    ) -> Header {
+        make_chain_header_with_nonce(height, parent_id, timestamp, n_bits, height.to_be_bytes().repeat(2))
+    }
+
+    fn make_chain_header_with_nonce(
+        height: u32,
+        parent_id: BlockId,
+        timestamp: u64,
+        n_bits: u32,
+        nonce: Vec<u8>,
+    ) -> Header {
+        let zero32 = Digest32::zero();
+        let mut header = Header {
+            version: 2,
+            id: BlockId(Digest32::zero()),
+            parent_id,
+            ad_proofs_root: zero32,
+            state_root: ADDigest::zero(),
+            transaction_root: zero32,
+            timestamp,
+            n_bits,
+            height,
+            extension_root: zero32,
+            autolykos_solution: AutolykosSolution {
+                miner_pk: Box::new(EcPoint::default()),
+                pow_onetime_pk: None,
+                nonce,
+                pow_distance: None,
+            },
+            votes: Votes([0, 0, 0]),
+            unparsed_bytes: Box::new([]),
+        };
+        let bytes = header.scorex_serialize_bytes().unwrap();
+        let reparsed = Header::scorex_parse_bytes(&bytes).unwrap();
+        header.id = reparsed.id;
+        header
+    }
+
+    fn testnet_config() -> ChainConfig {
+        ChainConfig::testnet()
+    }
+
+    /// Build a synthetic "suffix" — k headers starting at `start_height`
+    /// with the given parent_id, all with the same n_bits.
+    fn build_suffix(
+        start_height: u32,
+        first_parent: BlockId,
+        first_timestamp: u64,
+        n_bits: u32,
+        count: u32,
+    ) -> Vec<Header> {
+        let mut headers = Vec::with_capacity(count as usize);
+        let mut prev_id = first_parent;
+        for i in 0..count {
+            let h = make_chain_header_with_nonce(
+                start_height + i,
+                prev_id,
+                first_timestamp + (i as u64) * 50_000,
+                n_bits,
+                vec![0xEE; 8],
+            );
+            prev_id = h.id;
+            headers.push(h);
+        }
+        headers
+    }
+
+    // --- install_from_nipopow_proof tests ---
+
+    #[test]
+    fn install_succeeds_on_empty_chain() {
+        // A fresh chain accepts the install. tip(), height(), and is_empty()
+        // reflect the installed suffix.
+        let config = testnet_config();
+        let mut chain = HeaderChain::new(config.clone());
+        assert!(chain.is_empty());
+
+        // 5-header suffix starting at height 1000 (well above genesis to
+        // exercise the "install at arbitrary height" property).
+        let parent = BlockId(Digest32::from([0x77; 32]));
+        let suffix = build_suffix(1000, parent, 5_000_000, config.initial_n_bits, 5);
+        let suffix_head = suffix[0].clone();
+        let suffix_tail: Vec<Header> = suffix[1..].to_vec();
+        let last_id = suffix.last().unwrap().id;
+        let last_height = suffix.last().unwrap().height;
+
+        chain
+            .install_from_nipopow_proof_no_pow(suffix_head, suffix_tail)
+            .expect("install must succeed on empty chain");
+
+        assert!(!chain.is_empty());
+        assert_eq!(chain.height(), last_height);
+        assert_eq!(chain.tip().id, last_id);
+        assert!(chain.light_client_mode());
+        // scores[0] = 0 — see Phase 6 doc on cumulative-difficulty meaninglessness.
+        assert_eq!(*chain.score_at(1000).unwrap(), num_bigint::BigUint::ZERO);
+    }
+
+    #[test]
+    fn install_succeeds_with_empty_suffix_tail() {
+        // The contract permits a single-header install (suffix_tail empty).
+        let config = testnet_config();
+        let mut chain = HeaderChain::new(config.clone());
+
+        let parent = BlockId(Digest32::from([0x77; 32]));
+        let head = make_chain_header(500, parent, 5_000_000, config.initial_n_bits);
+        let head_id = head.id;
+
+        chain
+            .install_from_nipopow_proof_no_pow(head, vec![])
+            .expect("install must succeed");
+
+        assert_eq!(chain.height(), 500);
+        assert_eq!(chain.tip().id, head_id);
+        assert!(chain.light_client_mode());
+    }
+
+    #[test]
+    fn install_rejects_non_empty_chain() {
+        // A chain that already contains headers cannot be re-installed.
+        let config = testnet_config();
+        let mut chain = HeaderChain::new(config.clone());
+        let genesis = make_chain_header(1, BlockId(Digest32::zero()), 1_000_000, config.initial_n_bits);
+        chain.try_append_no_pow(genesis).unwrap();
+
+        let parent = BlockId(Digest32::from([0x77; 32]));
+        let suffix = build_suffix(100, parent, 5_000_000, config.initial_n_bits, 3);
+        let suffix_head = suffix[0].clone();
+        let suffix_tail: Vec<Header> = suffix[1..].to_vec();
+
+        let err = chain
+            .install_from_nipopow_proof_no_pow(suffix_head, suffix_tail)
+            .unwrap_err();
+        assert!(matches!(err, ChainError::ChainNotEmpty));
+
+        // Chain is unchanged.
+        assert_eq!(chain.height(), 1);
+        assert!(!chain.light_client_mode());
+    }
+
+    #[test]
+    fn install_rejects_broken_parent_linkage_in_suffix() {
+        // suffix_tail[1].parent_id deliberately points to nowhere — install
+        // must fail and roll back ALL state (suffix_head + light_client_mode).
+        let config = testnet_config();
+        let mut chain = HeaderChain::new(config.clone());
+
+        let parent = BlockId(Digest32::from([0x77; 32]));
+        let mut suffix = build_suffix(1000, parent, 5_000_000, config.initial_n_bits, 4);
+        // Break the link between suffix[1] and suffix[2].
+        suffix[2] = make_chain_header_with_nonce(
+            1002,
+            BlockId(Digest32::from([0xDE; 32])), // bogus parent
+            5_100_000,
+            config.initial_n_bits,
+            vec![0xFF; 8],
+        );
+        let suffix_head = suffix[0].clone();
+        let suffix_tail: Vec<Header> = suffix[1..].to_vec();
+
+        let err = chain
+            .install_from_nipopow_proof_no_pow(suffix_head, suffix_tail)
+            .unwrap_err();
+        assert!(matches!(err, ChainError::ParentNotFound { .. }));
+
+        // Full rollback: chain is empty, light_client_mode is back to false.
+        assert!(chain.is_empty());
+        assert_eq!(chain.height(), 0);
+        assert!(!chain.light_client_mode());
+    }
+
+    #[test]
+    fn install_rejects_bad_pow_via_real_path() {
+        // Real install_from_nipopow_proof (with PoW) must reject synthetic
+        // headers when the difficulty target is meaningful. Note that the
+        // testnet `initial_n_bits` decodes to difficulty 1, so any random
+        // pow_hit passes — synthetic headers with that target ARE accepted
+        // by `verify_pow` (this is why the `_no_pow` test variants exist).
+        //
+        // To exercise the rejection path we use a real testnet nBits value
+        // (`72286528`, decoded difficulty 1_325_481_984) — the synthetic
+        // nonce will essentially never satisfy `pow_hit < q / D` at that
+        // difficulty.
+        let mut chain = HeaderChain::new(testnet_config());
+
+        let high_n_bits = 72286528u32;
+        let parent = BlockId(Digest32::from([0x77; 32]));
+        let suffix = build_suffix(1000, parent, 5_000_000, high_n_bits, 3);
+        let suffix_head = suffix[0].clone();
+        let suffix_tail: Vec<Header> = suffix[1..].to_vec();
+
+        let err = chain
+            .install_from_nipopow_proof(suffix_head, suffix_tail)
+            .unwrap_err();
+        assert!(
+            matches!(err, ChainError::PowInvalid { .. } | ChainError::PowCompute(_)),
+            "expected PoW failure, got {err:?}"
+        );
+
+        // Chain unchanged on error.
+        assert!(chain.is_empty());
+        assert!(!chain.light_client_mode());
+    }
+
+    #[test]
+    fn try_append_after_install_extends_tip() {
+        // Key test: post-install, a valid child of the suffix tip is
+        // accepted by try_append_no_pow. Difficulty check is skipped because
+        // light_client_mode is set.
+        let config = testnet_config();
+        let mut chain = HeaderChain::new(config.clone());
+        let parent = BlockId(Digest32::from([0x77; 32]));
+        let suffix = build_suffix(1000, parent, 5_000_000, config.initial_n_bits, 3);
+        let suffix_head = suffix[0].clone();
+        let suffix_tail: Vec<Header> = suffix[1..].to_vec();
+
+        chain
+            .install_from_nipopow_proof_no_pow(suffix_head, suffix_tail)
+            .expect("install");
+        let tip = chain.tip().clone();
+        assert_eq!(chain.height(), 1002);
+
+        // Build a valid child.
+        let child = make_chain_header_with_nonce(
+            1003,
+            tip.id,
+            tip.timestamp + 50_000,
+            config.initial_n_bits,
+            vec![0xAB; 8],
+        );
+        let result = chain
+            .try_append_no_pow(child)
+            .expect("try_append must succeed in light mode");
+        assert!(matches!(result, AppendResult::Extended));
+        assert_eq!(chain.height(), 1003);
+    }
+
+    // --- light_client_mode skip tests ---
+
+    #[test]
+    fn light_mode_accepts_wrong_n_bits_post_install() {
+        // In normal (full) mode, a child header with a deliberately wrong
+        // n_bits is rejected. After install, the same kind of mismatch is
+        // accepted because light mode skips the difficulty check entirely.
+        let config = testnet_config();
+
+        // 1) Normal-mode rejection: build a chain at genesis, try a child
+        //    with wrong n_bits, expect WrongDifficulty.
+        let mut full_chain = HeaderChain::new(config.clone());
+        let genesis = make_chain_header(1, BlockId(Digest32::zero()), 1_000_000, config.initial_n_bits);
+        let genesis_id = genesis.id;
+        full_chain.try_append_no_pow(genesis).unwrap();
+        let bad_child = make_chain_header(2, genesis_id, 2_000_000, config.initial_n_bits + 1);
+        let err = full_chain.try_append_no_pow(bad_child).unwrap_err();
+        assert!(
+            matches!(err, ChainError::WrongDifficulty { .. }),
+            "full mode must reject wrong n_bits"
+        );
+
+        // 2) Light-mode acceptance: install a fresh chain from a synthetic
+        //    1-header suffix and try the same kind of "wrong n_bits" child.
+        //    The difficulty check is skipped, so it should be accepted.
+        let mut light_chain = HeaderChain::new(config.clone());
+        let parent = BlockId(Digest32::from([0x42; 32]));
+        let head = make_chain_header_with_nonce(
+            5000,
+            parent,
+            6_000_000,
+            config.initial_n_bits,
+            vec![0xC0; 8],
+        );
+        let head_id = head.id;
+        let head_ts = head.timestamp;
+        light_chain
+            .install_from_nipopow_proof_no_pow(head, vec![])
+            .expect("install");
+        // Append a child with deliberately-wrong n_bits — would be a
+        // WrongDifficulty error in full mode. Light mode trusts whatever
+        // n_bits the network sent.
+        let child = make_chain_header_with_nonce(
+            5001,
+            head_id,
+            head_ts + 50_000,
+            config.initial_n_bits + 1, // wrong on purpose
+            vec![0xC1; 8],
+        );
+        let result = light_chain
+            .try_append_no_pow(child)
+            .expect("light mode must accept wrong n_bits");
+        assert!(matches!(result, AppendResult::Extended));
+        assert_eq!(light_chain.height(), 5001);
+    }
+
+    // --- reorg_floor tests ---
+
+    #[test]
+    fn reorg_floor_genesis_chain_returns_one() {
+        // A normal chain starting at genesis has reorg_floor() == 1, which
+        // is the structural expression of "can't reorg past genesis".
+        let config = testnet_config();
+        let mut chain = HeaderChain::new(config.clone());
+        let genesis = make_chain_header(1, BlockId(Digest32::zero()), 1_000_000, config.initial_n_bits);
+        chain.try_append_no_pow(genesis).unwrap();
+        assert_eq!(chain.reorg_floor(), 1);
+    }
+
+    #[test]
+    fn reorg_floor_empty_chain_returns_one() {
+        // Back-compat: empty chains return 1. Reorg machinery refuses
+        // empty chains anyway, so the value is informational.
+        let chain = HeaderChain::new(testnet_config());
+        assert_eq!(chain.reorg_floor(), 1);
+    }
+
+    #[test]
+    fn reorg_floor_light_installed_chain_returns_install_height() {
+        // After installing a suffix at height N, reorg_floor() returns N.
+        let config = testnet_config();
+        let mut chain = HeaderChain::new(config.clone());
+        let parent = BlockId(Digest32::from([0x77; 32]));
+        let suffix = build_suffix(2500, parent, 5_000_000, config.initial_n_bits, 4);
+        let head = suffix[0].clone();
+        let tail: Vec<Header> = suffix[1..].to_vec();
+        chain.install_from_nipopow_proof_no_pow(head, tail).unwrap();
+        assert_eq!(chain.reorg_floor(), 2500);
+    }
+
+    #[test]
+    fn try_reorg_deep_rejects_fork_below_install_floor() {
+        // A reorg whose fork point is below the install boundary must be
+        // rejected with a clear error (no panic, no partial state mutation).
+        let config = testnet_config();
+        let mut chain = HeaderChain::new(config.clone());
+        let parent = BlockId(Digest32::from([0x77; 32]));
+        let suffix = build_suffix(2500, parent, 5_000_000, config.initial_n_bits, 4);
+        let head = suffix[0].clone();
+        let tail: Vec<Header> = suffix[1..].to_vec();
+        chain.install_from_nipopow_proof_no_pow(head, tail).unwrap();
+
+        // Try to reorg from height 2499 (below the install boundary 2500).
+        let bogus = make_chain_header_with_nonce(
+            2500,
+            BlockId(Digest32::from([0xCC; 32])),
+            5_500_000,
+            config.initial_n_bits,
+            vec![0xDD; 8],
+        );
+        let err = chain
+            .try_reorg_deep_no_pow(2499, vec![bogus])
+            .unwrap_err();
+        match &err {
+            ChainError::Reorg(msg) => {
+                assert!(
+                    msg.contains("below reorg floor"),
+                    "error must mention reorg floor: {msg}"
+                );
+            }
+            other => panic!("expected Reorg error, got {other:?}"),
+        }
+
+        // Chain still at the installed tip, light mode still set.
+        assert_eq!(chain.height(), 2503);
+        assert!(chain.light_client_mode());
+    }
+}

@@ -72,4 +72,9 @@ pub enum ChainError {
     /// NiPoPoW proof error.
     #[error("nipopow error: {0}")]
     Nipopow(String),
+
+    /// `install_from_nipopow_proof` was called on a chain that already
+    /// contains headers. The install API only accepts an empty chain.
+    #[error("chain not empty: install_from_nipopow_proof requires is_empty()")]
+    ChainNotEmpty,
 }

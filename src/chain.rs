@@ -79,6 +79,17 @@ pub struct HeaderChain {
     /// before calling [`Self::recompute_active_parameters_from_storage`]
     /// or [`crate::nipopow_proof::build_nipopow_proof`].
     extension_loader: Option<ExtensionLoader>,
+    /// Set to `true` by [`Self::install_from_nipopow_proof`] and never
+    /// reset. When `true`, [`Self::validate_child`] and (under `cfg(test)`)
+    /// `validate_child_no_pow` skip the `expected_difficulty` recalculation
+    /// and the `header.n_bits` comparison.
+    ///
+    /// Standard SPV behavior — light clients can't recompute
+    /// `expected_difficulty` because the recalc reads
+    /// `use_last_epochs * epoch_length` headers of pre-install history that
+    /// they don't have. PoW verification, parent linkage, and timestamp
+    /// bounds remain in force. See `facts/chain.md` Phase 6 invariants.
+    light_client_mode: bool,
 }
 
 /// All-zeros parent ID expected for the genesis header.
@@ -105,6 +116,7 @@ impl HeaderChain {
             active_parameters,
             active_disabling_rules: Vec::new(),
             extension_loader: None,
+            light_client_mode: false,
         }
     }
 
@@ -657,6 +669,155 @@ impl HeaderChain {
         Ok(crate::voting::tally_votes(headers))
     }
 
+    // --- Light-client install ---
+
+    /// Install a verified NiPoPoW proof's suffix as the chain's starting
+    /// point for light-client mode.
+    ///
+    /// **Precondition**: chain is empty ([`Self::is_empty`] returns `true`).
+    /// The headers in `suffix_head` + `suffix_tail` MUST already have been
+    /// validated by the caller via
+    /// [`crate::nipopow_proof::verify_nipopow_proof_bytes`]. This function
+    /// does NOT re-verify the proof; it assumes the caller has done so and
+    /// is installing the trusted suffix.
+    ///
+    /// **Postcondition on Ok**: chain contains `suffix_head` followed by
+    /// every header in `suffix_tail`, in order. `tip()` returns the last
+    /// header in `suffix_tail` (or `suffix_head` if `suffix_tail` is empty).
+    /// Subsequent `try_append` calls extend the tip from there using normal
+    /// parent-linkage rules. [`Self::light_client_mode`] is set to `true`
+    /// and persists for the chain's lifetime.
+    ///
+    /// **Postcondition on Err**: chain is unchanged. Possible errors:
+    /// - [`ChainError::ChainNotEmpty`] if the chain already contains headers.
+    /// - [`ChainError::ParentNotFound`] if any header in `suffix_tail` does
+    ///   not link to its predecessor's id.
+    /// - PoW failure on any header.
+    ///
+    /// The genesis-parent check is bypassed — light clients install at
+    /// arbitrary heights. `scores[0]` is initialized to 0 because cumulative
+    /// difficulty across the install boundary is meaningless; only deltas
+    /// matter post-install. The reorg floor (see [`Self::reorg_floor`])
+    /// prevents reorgs that would unwind past the install point.
+    ///
+    /// `active_parameters` is left at the chain-internal defaults — light
+    /// clients have no source for voted parameters because they don't
+    /// download block extensions. See `facts/chain.md` Phase 6
+    /// "Light-client parameter limitation".
+    pub fn install_from_nipopow_proof(
+        &mut self,
+        suffix_head: Header,
+        suffix_tail: Vec<Header>,
+    ) -> Result<(), ChainError> {
+        self.install_from_nipopow_proof_impl(suffix_head, suffix_tail, true)
+    }
+
+    fn install_from_nipopow_proof_impl(
+        &mut self,
+        suffix_head: Header,
+        suffix_tail: Vec<Header>,
+        verify_pow: bool,
+    ) -> Result<(), ChainError> {
+        if !self.is_empty() {
+            return Err(ChainError::ChainNotEmpty);
+        }
+
+        // Verify PoW on suffix_head before mutating any state. The validator
+        // contract says the caller already verified the proof, but PoW is
+        // cheap to recheck and gives us a clean rollback path: if the head
+        // is bad we never touched the chain.
+        if verify_pow {
+            crate::verify_pow(&suffix_head)?;
+        }
+
+        // Push suffix_head bypassing validate_genesis: it is rarely actually
+        // genesis (height 1) and its parent_id is whatever the upstream chain
+        // happens to be. scores[0] starts at 0 — see doc above.
+        let head_id = suffix_head.id;
+        let head_height = suffix_head.height;
+        self.by_id.insert(head_id, head_height);
+        self.by_height.push(suffix_head);
+        self.scores.push(BigUint::ZERO);
+        self.light_client_mode = true;
+
+        // Walk suffix_tail. On any failure, roll back EVERYTHING (including
+        // suffix_head and the light_client_mode flag) so the chain is
+        // unchanged on Err per the postcondition.
+        for header in suffix_tail {
+            let tip_id = self.tip().id;
+            if header.parent_id != tip_id {
+                self.rollback_install();
+                return Err(ChainError::ParentNotFound {
+                    parent_id: header.parent_id,
+                });
+            }
+            if header.height != self.tip().height + 1 {
+                let expected = self.tip().height + 1;
+                self.rollback_install();
+                return Err(ChainError::NonSequentialHeight {
+                    expected,
+                    got: header.height,
+                });
+            }
+            if verify_pow {
+                if let Err(e) = crate::verify_pow(&header) {
+                    self.rollback_install();
+                    return Err(e);
+                }
+            }
+            // Use push_header so suffix_tail headers' scores are
+            // parent_score + diff. Since scores[0] = 0, this just accumulates
+            // diffs from the install boundary onwards — only deltas matter
+            // for post-install reorg comparisons.
+            self.push_header(header);
+        }
+
+        Ok(())
+    }
+
+    /// Test variant of [`Self::install_from_nipopow_proof`] that skips the
+    /// per-header PoW check. Used by unit tests on synthetic chains where
+    /// headers don't carry real Autolykos solutions.
+    #[cfg(test)]
+    pub(crate) fn install_from_nipopow_proof_no_pow(
+        &mut self,
+        suffix_head: Header,
+        suffix_tail: Vec<Header>,
+    ) -> Result<(), ChainError> {
+        self.install_from_nipopow_proof_impl(suffix_head, suffix_tail, false)
+    }
+
+    /// Roll back a partial light-client install. Used internally only.
+    fn rollback_install(&mut self) {
+        self.by_height.clear();
+        self.by_id.clear();
+        self.scores.clear();
+        self.light_client_mode = false;
+    }
+
+    /// The minimum fork-point height that the reorg machinery is allowed to
+    /// accept.
+    ///
+    /// - Full chains starting at genesis: returns `1` (the existing
+    ///   "can't reorg past genesis" guard, expressed structurally).
+    /// - Light chains installed via [`Self::install_from_nipopow_proof`]:
+    ///   returns the suffix-head height. Reorgs that would require unwinding
+    ///   past the install boundary are rejected — we don't have the headers
+    ///   to roll back to.
+    ///
+    /// Empty chains return `1` for back-compat (the value is meaningless
+    /// because reorg machinery refuses empty chains anyway).
+    pub fn reorg_floor(&self) -> u32 {
+        self.by_height.first().map(|h| h.height).unwrap_or(1)
+    }
+
+    /// Whether this chain has been installed from a NiPoPoW proof and is
+    /// running in light-client mode (no block bodies, no transaction
+    /// validation, no expected-difficulty recalculation).
+    pub fn light_client_mode(&self) -> bool {
+        self.light_client_mode
+    }
+
     // --- Reorg ---
 
     /// Perform a 1-deep chain reorganization.
@@ -793,6 +954,18 @@ impl HeaderChain {
         if self.by_height.is_empty() {
             return Err(ChainError::Reorg("chain is empty".into()));
         }
+
+        // Reorg floor: cannot fork below the chain's lowest stored header.
+        // Full-mode chains starting at genesis: floor = 1, no-op for any
+        // fork point ≥ 1. Light-mode chains installed at height N: floor =
+        // N, load-bearing — we don't have the headers to unwind below it.
+        let floor = self.reorg_floor();
+        if fork_point_height < floor {
+            return Err(ChainError::Reorg(format!(
+                "fork point height {fork_point_height} below reorg floor {floor}"
+            )));
+        }
+
         let base = self.by_height[0].height;
         let fork_idx = fork_point_height
             .checked_sub(base)
@@ -1005,13 +1178,16 @@ impl HeaderChain {
                 got: header.timestamp,
             });
         }
-        let expected_n_bits = crate::difficulty::expected_difficulty(tip, self)?;
-        if header.n_bits != expected_n_bits {
-            return Err(ChainError::WrongDifficulty {
-                height: header.height,
-                expected: expected_n_bits,
-                got: header.n_bits,
-            });
+        // Skip difficulty check in light-client mode — see `validate_child`.
+        if !self.light_client_mode {
+            let expected_n_bits = crate::difficulty::expected_difficulty(tip, self)?;
+            if header.n_bits != expected_n_bits {
+                return Err(ChainError::WrongDifficulty {
+                    height: header.height,
+                    expected: expected_n_bits,
+                    got: header.n_bits,
+                });
+            }
         }
         Ok(())
     }
@@ -1078,13 +1254,18 @@ impl HeaderChain {
             });
         }
 
-        let expected_n_bits = crate::difficulty::expected_difficulty(tip, self)?;
-        if header.n_bits != expected_n_bits {
-            return Err(ChainError::WrongDifficulty {
-                height: header.height,
-                expected: expected_n_bits,
-                got: header.n_bits,
-            });
+        // SPV: light clients cannot recompute expected_difficulty because
+        // they lack the historical epoch boundaries the recalc depends on.
+        // See `facts/chain.md` Phase 6 light_client_mode invariant.
+        if !self.light_client_mode {
+            let expected_n_bits = crate::difficulty::expected_difficulty(tip, self)?;
+            if header.n_bits != expected_n_bits {
+                return Err(ChainError::WrongDifficulty {
+                    height: header.height,
+                    expected: expected_n_bits,
+                    got: header.n_bits,
+                });
+            }
         }
 
         crate::verify_pow(header)?;

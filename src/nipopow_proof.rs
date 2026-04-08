@@ -22,9 +22,17 @@ use crate::error::ChainError;
 /// caps the proof size for sanity.
 pub const MAX_M_K: u32 = 256;
 
-/// Metadata extracted from a verified NiPoPoW proof.
+/// Result of a successful NiPoPoW proof verification.
+///
+/// Carries the metadata fields used by serve-side log paths AND the full
+/// extracted header chain so the light-client install path can pass it to
+/// [`HeaderChain::install_from_nipopow_proof`] without re-parsing the bytes.
+///
+/// Renamed from `NipopowProofMeta` (which only carried metadata) to reflect
+/// the new return shape. Existing serve-side consumers reference fields by
+/// name only, so the rename is type-name-only there.
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub struct NipopowProofMeta {
+pub struct NipopowVerificationResult {
     /// Height of the suffix tip (highest header in the proof).
     pub suffix_tip_height: u32,
     /// Total number of headers in the proof (prefix + suffix).
@@ -35,6 +43,16 @@ pub struct NipopowProofMeta {
     /// continuous-mode flag from `NipopowProof`. Difficulty-recalculation
     /// header presence is not separately validated either.
     pub continuous: bool,
+    /// Headers extracted from the verified proof, in strictly-increasing
+    /// height order: `prefix.iter().map(|p| p.header)
+    ///     .chain(once(suffix_head.header))
+    ///     .chain(suffix_tail)`.
+    ///
+    /// The light-client install path passes `headers.last()` as `suffix_head`
+    /// and the `k - 1` headers preceding it as `suffix_tail`. Callers that
+    /// only want metadata (the existing serve-side log path) can ignore the
+    /// field at zero parsing cost — it's already materialized.
+    pub headers: Vec<Header>,
 }
 
 /// `PopowHeaderReader` adapter over the local `HeaderChain`.
@@ -200,7 +218,10 @@ pub fn build_nipopow_proof(
 ///    `NipopowProof::has_valid_connections`).
 ///
 /// Does NOT touch chain state. Does NOT apply the proof to local chain.
-pub fn verify_nipopow_proof_bytes(bytes: &[u8]) -> Result<NipopowProofMeta, ChainError> {
+/// The returned [`NipopowVerificationResult::headers`] field carries the
+/// extracted header chain in height order so the caller can install it via
+/// [`crate::HeaderChain::install_from_nipopow_proof`] without re-parsing.
+pub fn verify_nipopow_proof_bytes(bytes: &[u8]) -> Result<NipopowVerificationResult, ChainError> {
     verify_inner(bytes, true)
 }
 
@@ -210,11 +231,11 @@ pub fn verify_nipopow_proof_bytes(bytes: &[u8]) -> Result<NipopowProofMeta, Chai
 #[cfg(test)]
 pub(crate) fn verify_nipopow_proof_bytes_no_pow(
     bytes: &[u8],
-) -> Result<NipopowProofMeta, ChainError> {
+) -> Result<NipopowVerificationResult, ChainError> {
     verify_inner(bytes, false)
 }
 
-fn verify_inner(bytes: &[u8], check_pow: bool) -> Result<NipopowProofMeta, ChainError> {
+fn verify_inner(bytes: &[u8], check_pow: bool) -> Result<NipopowVerificationResult, ChainError> {
     if bytes.is_empty() {
         return Err(ChainError::Nipopow("empty proof bytes".into()));
     }
@@ -226,14 +247,16 @@ fn verify_inner(bytes: &[u8], check_pow: bool) -> Result<NipopowProofMeta, Chain
         return Err(ChainError::Nipopow("invalid connections".into()));
     }
 
-    // Walk all headers (prefix + suffix_head + suffix_tail) in order and
-    // check strictly-increasing heights + (optionally) PoW.
-    let all_headers: Vec<&Header> = proof
+    // Walk all headers (prefix + suffix_head + suffix_tail) in order, check
+    // strictly-increasing heights + (optionally) PoW, and retain ownership
+    // so the caller can install them without re-parsing the bytes.
+    let all_headers: Vec<Header> = proof
         .prefix
         .iter()
         .map(|p| &p.header)
         .chain(std::iter::once(&proof.suffix_head.header))
         .chain(proof.suffix_tail.iter())
+        .cloned()
         .collect();
 
     if all_headers.is_empty() {
@@ -256,10 +279,11 @@ fn verify_inner(bytes: &[u8], check_pow: bool) -> Result<NipopowProofMeta, Chain
         }
     }
 
-    Ok(NipopowProofMeta {
+    Ok(NipopowVerificationResult {
         suffix_tip_height: last_height.unwrap_or(0),
         total_headers: all_headers.len(),
         continuous: false,
+        headers: all_headers,
     })
 }
 
@@ -434,9 +458,21 @@ mod tests {
     fn build_then_verify_roundtrip_no_pow() {
         let chain = build_chain_with_interlinks(20);
         let bytes = build_nipopow_proof(&chain, 2, 2, None).expect("build");
-        let meta = verify_nipopow_proof_bytes_no_pow(&bytes).expect("verify");
-        assert!(meta.total_headers > 0);
-        assert_eq!(meta.suffix_tip_height, 20);
+        let result = verify_nipopow_proof_bytes_no_pow(&bytes).expect("verify");
+        assert!(result.total_headers > 0);
+        assert_eq!(result.suffix_tip_height, 20);
+        // The headers field carries the same chain that's reflected in
+        // total_headers + suffix_tip_height — the install path consumes it
+        // directly without re-parsing the bytes.
+        assert_eq!(result.headers.len(), result.total_headers);
+        assert_eq!(
+            result.headers.last().unwrap().height,
+            result.suffix_tip_height
+        );
+        // Heights are strictly increasing across the extracted chain.
+        for pair in result.headers.windows(2) {
+            assert!(pair[0].height < pair[1].height);
+        }
     }
 
     #[test]
@@ -470,9 +506,9 @@ mod tests {
         // build, serialize, and round-trip back through the verifier.
         let chain = build_chain_with_interlinks_opts(20, false);
         let bytes = build_nipopow_proof(&chain, 2, 2, None).expect("build");
-        let meta = verify_nipopow_proof_bytes_no_pow(&bytes).expect("verify");
-        assert!(meta.total_headers >= 4); // m + k = 4
-        assert_eq!(meta.suffix_tip_height, 20);
+        let result = verify_nipopow_proof_bytes_no_pow(&bytes).expect("verify");
+        assert!(result.total_headers >= 4); // m + k = 4
+        assert_eq!(result.suffix_tip_height, 20);
     }
 
     #[test]

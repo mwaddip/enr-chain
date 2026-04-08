@@ -32,7 +32,9 @@ pub use state_type::StateType;
 pub use sync_info::{build_sync_info, parse_sync_info, SyncInfo};
 pub use num_bigint::BigUint;
 pub use tracker::HeaderTracker;
-pub use nipopow_proof::{build_nipopow_proof, verify_nipopow_proof_bytes, NipopowProofMeta};
+pub use nipopow_proof::{
+    build_nipopow_proof, verify_nipopow_proof_bytes, NipopowVerificationResult,
+};
 pub use voting::{
     extract_disabling_rules_from_kv, pack_extension_bytes, pack_parameters_to_kv,
     parse_extension_bytes, parse_parameters_from_kv, VotingConfig,
