@@ -10,7 +10,7 @@
 //! - `ergo-core/src/main/scala/org/ergoplatform/modifiers/history/popow/NipopowAlgos.scala`
 
 use ergo_chain_types::{BlockId, ExtensionCandidate, Header};
-use ergo_nipopow::{NipopowAlgos, NipopowProof, PoPowHeader};
+use ergo_nipopow::{NipopowAlgos, NipopowProof, PoPowHeader, PopowHeaderReader};
 use sigma_ser::ScorexSerializable;
 
 use crate::chain::HeaderChain;
@@ -37,6 +37,109 @@ pub struct NipopowProofMeta {
     pub continuous: bool,
 }
 
+/// `PopowHeaderReader` adapter over the local `HeaderChain`.
+///
+/// Backs [`build_nipopow_proof`] via
+/// [`ergo_nipopow::NipopowAlgos::prove_with_reader`]. The reader walks the
+/// interlink hierarchy on demand and only fetches the popow headers the
+/// proof actually visits — `O(m + k + m · log₂ N)` per call instead of `O(N)`.
+///
+/// **Genesis special case**: per `facts/chain.md` Phase 6 invariants, the
+/// genesis block's `interlinks = [genesis_id]` is canonical and the extension
+/// loader MUST NOT be called for `height == 1` (real testnet/mainnet genesis
+/// extensions are empty and would yield wrong interlinks). The
+/// `popow_header_at_height(1)` and `popow_header_by_id(genesis_id)` paths
+/// synthesize the popow header in-process; every other height path goes
+/// through the loader as normal.
+struct ChainPopowReader<'a> {
+    chain: &'a HeaderChain,
+}
+
+impl<'a> ChainPopowReader<'a> {
+    /// Synthesize a `PoPowHeader` for `header` with interlinks given by
+    /// `interlinks`. Builds a synthetic `ExtensionCandidate` carrying the
+    /// canonical packed-interlinks fields and feeds it through
+    /// `NipopowAlgos::proof_for_interlink_vector` so the resulting merkle
+    /// proof is byte-identical with the JVM equivalent.
+    fn build_popow_header(header: Header, interlinks: Vec<BlockId>) -> Option<PoPowHeader> {
+        let extension_candidate =
+            ExtensionCandidate::new(NipopowAlgos::pack_interlinks(interlinks.clone())).ok()?;
+        let interlinks_proof = NipopowAlgos::proof_for_interlink_vector(&extension_candidate)?;
+        Some(PoPowHeader {
+            header,
+            interlinks,
+            interlinks_proof,
+        })
+    }
+}
+
+impl<'a> PopowHeaderReader for ChainPopowReader<'a> {
+    fn headers_height(&self) -> u32 {
+        self.chain.height()
+    }
+
+    fn popow_header_by_id(&self, id: &BlockId) -> Option<PoPowHeader> {
+        let h = self.chain.height_of(id)?;
+        self.popow_header_at_height(h)
+    }
+
+    fn popow_header_at_height(&self, height: u32) -> Option<PoPowHeader> {
+        let header = self.chain.header_at(height)?.clone();
+
+        // Genesis: synthesize in-process. NEVER call the loader for h=1 —
+        // real genesis extensions are empty and would produce empty
+        // interlinks, which is wrong by convention.
+        if height == 1 {
+            let genesis_id = header.id;
+            return Self::build_popow_header(header, vec![genesis_id]);
+        }
+
+        // h >= 2: load real extension bytes, unpack canonical interlinks.
+        let loader = self.chain.extension_loader()?;
+        let ext_bytes = loader(height)?;
+        let (_, fields) = crate::voting::parse_extension_bytes(&ext_bytes).ok()?;
+        let extension_candidate = ExtensionCandidate::new(fields).ok()?;
+        let interlinks = NipopowAlgos::unpack_interlinks(&extension_candidate).ok()?;
+        let interlinks_proof = NipopowAlgos::proof_for_interlink_vector(&extension_candidate)?;
+        Some(PoPowHeader {
+            header,
+            interlinks,
+            interlinks_proof,
+        })
+    }
+
+    fn last_headers(&self, k: usize) -> Vec<Header> {
+        let height = self.chain.height();
+        let k_u32 = k as u32;
+        if k == 0 || k_u32 > height {
+            // sigma-rust handles `last.len() < k` with `ChainTooShort`; we
+            // surface the same condition by returning an empty vec.
+            return Vec::new();
+        }
+        let start = height - k_u32 + 1;
+        self.chain
+            .headers_from(start, k)
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    fn best_headers_after(&self, header: &Header, n: usize) -> Vec<Header> {
+        if n == 0 {
+            return Vec::new();
+        }
+        let start = match header.height.checked_add(1) {
+            Some(s) => s,
+            None => return Vec::new(),
+        };
+        self.chain
+            .headers_from(start, n)
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+}
+
 /// Build a NiPoPoW proof for the local chain.
 ///
 /// **Preconditions**:
@@ -48,8 +151,11 @@ pub struct NipopowProofMeta {
 /// Returns the inner serialized NiPoPoW proof bytes — NO P2P envelope.
 /// The main crate handles message wrapping when sending.
 ///
-/// **Determinism**: For any two correct implementations on the same chain
-/// state, the output is byte-identical.
+/// **Algorithm**: thin adapter over
+/// [`ergo_nipopow::NipopowAlgos::prove_with_reader`] using
+/// [`ChainPopowReader`]. The reader walks the interlink hierarchy on demand
+/// and only fetches the popow headers the proof actually visits —
+/// `O(m + k + m · log₂ N)` instead of `O(N)`. See `facts/chain.md` Phase 6.
 pub fn build_nipopow_proof(
     chain: &HeaderChain,
     m: u32,
@@ -65,100 +171,16 @@ pub fn build_nipopow_proof(
         )));
     }
 
-    let loader = chain.extension_loader().ok_or_else(|| {
-        ChainError::Nipopow("extension loader not set".into())
-    })?;
-
-    let suffix_tip_height = match header_id {
-        Some(id) => chain.height_of(&id).ok_or_else(|| {
-            ChainError::Nipopow("header_id not in chain".into())
-        })?,
-        None => chain.height(),
-    };
-
-    if suffix_tip_height < (m + k) {
-        return Err(ChainError::Nipopow(format!(
-            "chain too short: need at least m+k = {} headers, have {}",
-            m + k,
-            suffix_tip_height
-        )));
+    // The reader's h>=2 path delegates to the loader, so it must be wired.
+    // (The h==1 path synthesizes genesis in-process and doesn't touch it.)
+    if chain.extension_loader().is_none() {
+        return Err(ChainError::Nipopow("extension loader not set".into()));
     }
 
-    // Build PoPowHeaders for heights 1..=suffix_tip_height.
-    let mut popow_headers: Vec<PoPowHeader> = Vec::with_capacity(suffix_tip_height as usize);
-    for h in 1..=suffix_tip_height {
-        let header = chain
-            .header_at(h)
-            .ok_or_else(|| {
-                ChainError::Nipopow(format!("header at height {h} missing"))
-            })?
-            .clone();
-
-        // Genesis (h=1) special case: per the contract in `facts/chain.md`
-        // (Phase 6 → `build_nipopow_proof`), the genesis block's interlinks
-        // vector is canonical (`[genesis_block_id]`) and MUST NOT be read
-        // from the loader. Real testnet/mainnet genesis extensions have
-        // `fields = []` (empty merkle root `0e5751c0...`), so calling the
-        // loader and unpacking would yield empty interlinks — wrong by
-        // convention and produces a malformed proof. We synthesize the
-        // genesis `PoPowHeader` in-process instead, mirroring the JVM
-        // node's `popowHeader(genesis_id)` path.
-        if h == 1 {
-            let interlinks = vec![header.id];
-            // Build a synthetic ExtensionCandidate from the canonical
-            // packed-interlinks bytes and feed it through the same merkle
-            // proof helper used for non-genesis heights. This guarantees
-            // byte-identical equivalence with the JVM's
-            // `NipopowAlgos.proofForInterlinkVector` output for the same
-            // inputs.
-            let synthetic_ext = ExtensionCandidate::new(
-                NipopowAlgos::pack_interlinks(interlinks.clone()),
-            )
-            .map_err(|e| {
-                ChainError::Nipopow(format!(
-                    "synthetic genesis ExtensionCandidate::new failed: {e}"
-                ))
-            })?;
-            let interlinks_proof = NipopowAlgos::proof_for_interlink_vector(&synthetic_ext)
-                .ok_or_else(|| {
-                    ChainError::Nipopow(
-                        "synthetic genesis proof_for_interlink_vector returned None".into(),
-                    )
-                })?;
-            popow_headers.push(PoPowHeader {
-                header,
-                interlinks,
-                interlinks_proof,
-            });
-            continue;
-        }
-
-        let ext_bytes = loader(h).ok_or_else(|| {
-            ChainError::Nipopow(format!("extension at height {h} missing from loader"))
-        })?;
-        let (_, fields) = crate::voting::parse_extension_bytes(&ext_bytes)?;
-        let extension_candidate = ExtensionCandidate::new(fields).map_err(|e| {
-            ChainError::Nipopow(format!("ExtensionCandidate::new failed: {e}"))
-        })?;
-
-        let interlinks = NipopowAlgos::unpack_interlinks(&extension_candidate)
-            .map_err(|e| ChainError::Nipopow(format!("unpack_interlinks: {e}")))?;
-        let interlinks_proof = NipopowAlgos::proof_for_interlink_vector(&extension_candidate)
-            .ok_or_else(|| {
-                ChainError::Nipopow("proof_for_interlink_vector returned None".into())
-            })?;
-
-        popow_headers.push(PoPowHeader {
-            header,
-            interlinks,
-            interlinks_proof,
-        });
-    }
-
-    let algos = NipopowAlgos::default();
-    let proof = algos
-        .prove(&popow_headers, k, m)
-        .map_err(|e| ChainError::Nipopow(format!("prove failed: {e:?}")))?;
+    let reader = ChainPopowReader { chain };
+    let proof = NipopowAlgos::default()
+        .prove_with_reader(&reader, header_id.as_ref(), k, m)
+        .map_err(|e| ChainError::Nipopow(format!("prove_with_reader failed: {e:?}")))?;
 
     proof
         .scorex_serialize_bytes()
