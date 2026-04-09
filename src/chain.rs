@@ -1167,6 +1167,14 @@ impl HeaderChain {
                 got: header.n_bits,
             });
         }
+        if let Some(expected_id) = &self.config.genesis_id {
+            if &header.id != expected_id {
+                return Err(ChainError::GenesisIdMismatch {
+                    expected: *expected_id,
+                    got: header.id,
+                });
+            }
+        }
         Ok(())
     }
 
@@ -1228,6 +1236,15 @@ impl HeaderChain {
         }
 
         crate::verify_pow(header)?;
+
+        if let Some(expected_id) = &self.config.genesis_id {
+            if &header.id != expected_id {
+                return Err(ChainError::GenesisIdMismatch {
+                    expected: *expected_id,
+                    got: header.id,
+                });
+            }
+        }
 
         Ok(())
     }

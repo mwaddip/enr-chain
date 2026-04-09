@@ -49,6 +49,10 @@ pub enum ChainError {
     #[error("invalid genesis height: expected 1, got {got}")]
     InvalidGenesisHeight { got: u32 },
 
+    /// Genesis header ID doesn't match the expected value for this network.
+    #[error("genesis ID mismatch: expected {expected}, got {got}")]
+    GenesisIdMismatch { expected: BlockId, got: BlockId },
+
     /// Difficulty calculation failed.
     #[error("difficulty calculation error: {0}")]
     DifficultyCalc(String),

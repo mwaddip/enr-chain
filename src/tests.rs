@@ -429,6 +429,24 @@ mod chain_tests {
     }
 
     #[test]
+    fn reject_genesis_wrong_id() {
+        // Build a config with a specific genesis ID requirement
+        let mut config = testnet_config();
+        let expected_id: BlockId = "b0244dfc267baca974a4caee06120321562784303a8a688976ae56170e4d175b"
+            .parse()
+            .unwrap();
+        config.genesis_id = Some(expected_id);
+
+        let mut chain = HeaderChain::new(config.clone());
+        // A synthetic genesis header whose computed ID won't match
+        let genesis = make_chain_header(1, genesis_parent_id(), 1_000_000, config.initial_n_bits);
+        assert_ne!(genesis.id, expected_id, "test requires ID mismatch");
+
+        let err = chain.try_append_no_pow(genesis).unwrap_err();
+        assert!(matches!(err, ChainError::GenesisIdMismatch { .. }));
+    }
+
+    #[test]
     fn append_child_after_genesis() {
         let config = testnet_config();
         let mut chain = HeaderChain::new(config.clone());

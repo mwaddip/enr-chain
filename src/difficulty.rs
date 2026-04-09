@@ -16,6 +16,16 @@ const PRECISION: i64 = 1_000_000_000;
 /// the parent's nBits unchanged.
 pub fn expected_difficulty(parent: &Header, chain: &HeaderChain) -> Result<u32, ChainError> {
     let config = chain.config();
+
+    // Autolykos v2 activation override — applied for two blocks at the transition.
+    // JVM: HeadersProcessor.requiredDifficultyAfter(), lines 355-358.
+    if let Some(v2_n_bits) = config.version2_activation_n_bits {
+        let v2_height = config.voting.version2_activation_height;
+        if v2_height > 0 && (parent.height == v2_height || parent.height + 1 == v2_height) {
+            return Ok(v2_n_bits);
+        }
+    }
+
     let epoch_length = config.epoch_length_at(parent.height + 1);
 
     // Recalculation happens when the parent is the last block of an epoch
@@ -396,5 +406,80 @@ mod tests {
 
         // Below 50%: floored to 500
         assert_eq!(cap_difficulty(&BigInt::from(100), &reference), BigInt::from(500));
+    }
+
+    #[test]
+    fn test_mainnet_initial_difficulty_roundtrip() {
+        // initialDifficultyHex = "011765000000" → BigInt 1,199,990,374,400
+        let n_bits = encode_compact_bits(&BigInt::from(1_199_990_374_400_u64)) as u32;
+        assert_eq!(n_bits, 100_734_821);
+    }
+
+    #[test]
+    fn test_mainnet_v2_activation_difficulty_roundtrip() {
+        // version2ActivationDifficultyHex = "6f98d5000000" → BigInt 122,702,199,259,136
+        let n_bits = encode_compact_bits(&BigInt::from(122_702_199_259_136_u64)) as u32;
+        assert_eq!(n_bits, 107_976_917);
+    }
+
+    #[test]
+    fn test_v2_override_triggers_at_correct_heights() {
+        use crate::chain::HeaderChain;
+        use crate::config::ChainConfig;
+        use ergo_chain_types::{ADDigest, AutolykosSolution, BlockId, Digest32, EcPoint, Votes};
+
+        let config = ChainConfig::mainnet();
+        let v2_height = config.voting.version2_activation_height; // 417792
+        let v2_n_bits = config.version2_activation_n_bits.unwrap(); // 107_976_917
+
+        let make_parent = |height: u32| -> Header {
+            Header {
+                version: 1,
+                parent_id: BlockId(Digest32::zero()),
+                ad_proofs_root: Digest32::zero(),
+                state_root: ADDigest::zero(),
+                transaction_root: Digest32::zero(),
+                timestamp: 1_000_000,
+                n_bits: 100_734_821,
+                height,
+                extension_root: Digest32::zero(),
+                autolykos_solution: AutolykosSolution {
+                    miner_pk: Box::new(EcPoint::default()),
+                    pow_onetime_pk: None,
+                    nonce: vec![0; 8],
+                    pow_distance: None,
+                },
+                votes: Votes([0, 0, 0]),
+                unparsed_bytes: Box::new([]),
+                id: BlockId(Digest32::zero()),
+            }
+        };
+
+        // parent.height == v2_height - 1 → child = v2_height → override
+        let parent = make_parent(v2_height - 1);
+        let chain = HeaderChain::new(config.clone());
+        assert_eq!(
+            expected_difficulty(&parent, &chain).unwrap(),
+            v2_n_bits,
+            "v2 override should trigger at child = v2_height"
+        );
+
+        // parent.height == v2_height → child = v2_height + 1 → override
+        let parent = make_parent(v2_height);
+        let chain = HeaderChain::new(config.clone());
+        assert_eq!(
+            expected_difficulty(&parent, &chain).unwrap(),
+            v2_n_bits,
+            "v2 override should trigger at child = v2_height + 1"
+        );
+
+        // parent.height == v2_height + 1 → child = v2_height + 2 → no override
+        let parent = make_parent(v2_height + 1);
+        let chain = HeaderChain::new(config.clone());
+        assert_ne!(
+            expected_difficulty(&parent, &chain).unwrap(),
+            v2_n_bits,
+            "v2 override should NOT trigger at child = v2_height + 2"
+        );
     }
 }

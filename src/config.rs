@@ -1,3 +1,5 @@
+use ergo_chain_types::BlockId;
+
 use crate::voting::VotingConfig;
 
 /// Network identity for the chain.
@@ -29,6 +31,12 @@ pub struct ChainConfig {
     pub use_last_epochs: u32,
     /// Difficulty for the very first block (encoded as nBits).
     pub initial_n_bits: u32,
+    /// nBits override at the Autolykos v2 activation height (mainnet only).
+    /// Applied for two blocks at the PoW algorithm transition.
+    pub version2_activation_n_bits: Option<u32>,
+    /// Expected genesis block header ID. If set, `validate_genesis()` rejects
+    /// headers whose ID doesn't match.
+    pub genesis_id: Option<BlockId>,
     /// Maximum allowed clock drift for timestamps, in milliseconds.
     /// Headers with `timestamp > now + max_time_drift` are rejected.
     pub max_time_drift_ms: u64,
@@ -50,6 +58,8 @@ impl ChainConfig {
             block_interval_ms: 45_000,
             use_last_epochs: 8,
             initial_n_bits: 16842752, // encode_compact_bits(1)
+            version2_activation_n_bits: None,
+            genesis_id: None,
             max_time_drift_ms: 10 * 45_000, // 450 seconds
             eip37_activation_height: None,
             eip37_epoch_length: None,
@@ -64,7 +74,13 @@ impl ChainConfig {
             epoch_length: 1024,
             block_interval_ms: 120_000,
             use_last_epochs: 8,
-            initial_n_bits: 16842752, // encode_compact_bits(1)
+            initial_n_bits: 100_734_821, // encode_compact_bits(BigInt(1199990374400))
+            version2_activation_n_bits: Some(107_976_917), // encode_compact_bits(BigInt(122702199259136))
+            genesis_id: Some(
+                "b0244dfc267baca974a4caee06120321562784303a8a688976ae56170e4d175b"
+                    .parse()
+                    .expect("mainnet genesis ID is valid hex"),
+            ),
             max_time_drift_ms: 10 * 120_000, // 1200 seconds
             eip37_activation_height: Some(844_673),
             eip37_epoch_length: Some(128),
