@@ -1868,6 +1868,47 @@ mod voting_chain_tests {
     }
 
     #[test]
+    fn recompute_mismatched_header_id_errors() {
+        use crate::voting::{pack_extension_bytes, pack_parameters_to_kv};
+        use std::collections::HashMap;
+
+        let mut chain = HeaderChain::new(testnet_config());
+        let n_bits = chain.config().initial_n_bits;
+
+        let mut prev = ergo_chain_types::BlockId(ergo_chain_types::Digest32::zero());
+        let g = make_header_with_votes(1, prev, 1_000_000, n_bits, [0, 0, 0]);
+        prev = g.id;
+        chain.try_append_no_pow(g).unwrap();
+        for h in 2..=130 {
+            let header = make_header_with_votes(
+                h, prev, 1_000_000 + (h as u64 - 1) * 45_000, n_bits, [0, 0, 0],
+            );
+            prev = header.id;
+            chain.try_append_no_pow(header).unwrap();
+        }
+
+        // Pack extension with a bogus header_id that doesn't match height 128.
+        let bogus_id = ergo_chain_types::BlockId(ergo_chain_types::Digest32::from([0xFFu8; 32]));
+        let mut params: HashMap<i8, i32> = HashMap::new();
+        params.insert(1, 1_300_000);
+        let kv = pack_parameters_to_kv(&params);
+        let extension_bytes = pack_extension_bytes(&bogus_id, &kv);
+
+        chain.set_extension_loader(move |h| {
+            if h == 128 {
+                Some(extension_bytes.clone())
+            } else {
+                None
+            }
+        });
+
+        let r = chain.recompute_active_parameters_from_storage();
+        assert!(r.is_err());
+        let msg = format!("{}", r.unwrap_err());
+        assert!(msg.contains("mismatch"), "expected mismatch error, got: {msg}");
+    }
+
+    #[test]
     fn soft_fork_lifecycle_full_traversal() {
         // Build a chain that:
         // 1. Votes unanimously for soft-fork (slot value 120) for the entire

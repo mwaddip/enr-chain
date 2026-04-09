@@ -310,7 +310,19 @@ impl HeaderChain {
             ))
         })?;
 
-        let (_header_id, fields) = crate::voting::parse_extension_bytes(&extension_bytes)?;
+        let (header_id, fields) = crate::voting::parse_extension_bytes(&extension_bytes)?;
+        let expected = self.header_at(boundary_height).ok_or_else(|| {
+            ChainError::Voting(format!(
+                "no header at boundary height {boundary_height}"
+            ))
+        })?;
+        if header_id != expected.id {
+            return Err(ChainError::Voting(format!(
+                "extension header_id mismatch at height {boundary_height}: \
+                 extension says {}, chain says {}",
+                header_id, expected.id
+            )));
+        }
         let parsed = crate::voting::parse_parameters_from_kv(&fields)?;
 
         // Build a Parameters table from the parsed kv. Start from network
