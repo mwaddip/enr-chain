@@ -221,6 +221,23 @@ pub fn build_nipopow_proof(
         .map_err(|e| ChainError::Nipopow(format!("serialize failed: {e:?}")))
 }
 
+/// Compare two NiPoPoW proofs from raw bytes (post-envelope, inner proof
+/// payload only). Returns `true` if `a` represents a better chain than `b`
+/// per KMZ17 §4.3.
+///
+/// Both byte slices must be valid NiPoPoW proof payloads (as produced by
+/// `NipopowProof::scorex_serialize_bytes`). Parse failure on either side
+/// returns an error.
+pub fn compare_nipopow_proof_bytes(a: &[u8], b: &[u8]) -> Result<bool, ChainError> {
+    let proof_a = NipopowProof::scorex_parse_bytes(a)
+        .map_err(|e| ChainError::Nipopow(format!("parse proof A failed: {e:?}")))?;
+    let proof_b = NipopowProof::scorex_parse_bytes(b)
+        .map_err(|e| ChainError::Nipopow(format!("parse proof B failed: {e:?}")))?;
+    proof_a
+        .is_better_than(&proof_b)
+        .map_err(|e| ChainError::Nipopow(format!("comparison failed: {e:?}")))
+}
+
 /// Verify a NiPoPoW proof from raw bytes.
 ///
 /// **Precondition**: `bytes` is the inner NiPoPoW proof payload (the main
