@@ -115,7 +115,23 @@ impl<'a> PopowHeaderReader for ChainPopowReader<'a> {
         // h >= 2: load real extension bytes, unpack canonical interlinks.
         let loader = self.chain.extension_loader()?;
         let ext_bytes = loader(height)?;
-        let (_, fields) = crate::voting::parse_extension_bytes(&ext_bytes).ok()?;
+        let (parsed_header_id, fields) =
+            crate::voting::parse_extension_bytes(&ext_bytes).ok()?;
+        // The loader is not trusted to return matching data: an upstream
+        // backward-walk recovery (e.g., enr-store papering over BEST_CHAIN
+        // holes) can return extension bytes for a different block at the
+        // queried height. Returning silently with wrong interlinks would
+        // produce a `PoPowHeader` whose `header` is from height `h` but
+        // whose `interlinks` belong to some other block — `prove_with_reader`
+        // would then walk into that wrong lineage and emit a prefix whose
+        // adjacent entries don't link via interlink, failing
+        // `NipopowProof::has_valid_connections()` at verify time. Reject
+        // mismatched bytes here so the walk surfaces as `MissingPopowHeader`,
+        // which `build_nipopow_proof` maps to `ChainError::Nipopow`. Clean
+        // fail beats silent corruption.
+        if parsed_header_id != header.id {
+            return None;
+        }
         let extension_candidate = ExtensionCandidate::new(fields).ok()?;
         let interlinks = NipopowAlgos::unpack_interlinks(&extension_candidate).ok()?;
         let interlinks_proof = NipopowAlgos::proof_for_interlink_vector(&extension_candidate)?;
@@ -523,5 +539,178 @@ mod tests {
         }
         let r = verify_nipopow_proof_bytes_no_pow(&bytes);
         assert!(r.is_err(), "mutated proof must fail");
+    }
+
+    #[test]
+    fn reader_rejects_extension_with_mismatched_header_id() {
+        // Focused regression test for the silent-corruption bug:
+        //
+        // `ChainPopowReader::popow_header_at_height` used to discard the
+        // header_id embedded in the extension bytes, accepting any payload
+        // the loader returned. If the integrator's loader returned bytes for
+        // a different block at the queried height — exactly what
+        // enr-store's backward-walk recovery does at BEST_CHAIN holes — the
+        // reader would silently produce a `PoPowHeader { header: chain[h],
+        // interlinks: <from-other-block> }`. The walker in
+        // `prove_with_reader` would then follow the wrong block's
+        // interlinks into a wrong lineage, producing a prefix whose
+        // adjacent entries don't link via interlink and failing
+        // `NipopowProof::has_valid_connections()` at verify time.
+        //
+        // Post-fix: the reader compares the extension's embedded header_id
+        // against the queried `header.id` and returns `None` on mismatch.
+        // This propagates up as `MissingPopowHeader` →
+        // `ChainError::Nipopow` at the chain crate boundary.
+        use std::sync::{Arc, Mutex};
+
+        let config = ChainConfig::testnet();
+        let mut chain = HeaderChain::new(config.clone());
+        let n_bits = config.initial_n_bits;
+
+        // Build a small chain.
+        let mut prev = BlockId(Digest32::zero());
+        for h in 1..=5u32 {
+            let hdr = make_synthetic_header(
+                h,
+                prev,
+                1_000_000 + (h as u64 - 1) * 45_000,
+                n_bits,
+            );
+            prev = hdr.id;
+            chain.try_append_no_pow(hdr).expect("append");
+        }
+
+        // Wire a loader that returns extension bytes whose embedded
+        // header_id is NOT the one for the queried height. The bytes are
+        // well-formed (parse_extension_bytes accepts them) — they just
+        // describe a different block.
+        let bogus_id = BlockId(Digest32::zero());
+        // chain.header_at(3).id is computed via Blake2b over the header
+        // serialization and is overwhelmingly unlikely to be all zeros.
+        assert_ne!(
+            chain.header_at(3).unwrap().id,
+            bogus_id,
+            "test relies on chain[3].id != bogus_id"
+        );
+        let bogus_fields = NipopowAlgos::pack_interlinks(vec![bogus_id]);
+        let bogus_bytes = pack_extension_bytes(&bogus_id, &bogus_fields);
+
+        let mut store: std::collections::HashMap<u32, Vec<u8>> =
+            std::collections::HashMap::new();
+        store.insert(3u32, bogus_bytes);
+        let store_arc = Arc::new(Mutex::new(store));
+        chain.set_extension_loader(move |height| {
+            store_arc.lock().unwrap().get(&height).cloned()
+        });
+
+        let reader = ChainPopowReader { chain: &chain };
+        let result = reader.popow_header_at_height(3);
+        assert!(
+            result.is_none(),
+            "popow_header_at_height(3) must return None when extension bytes carry a mismatched header_id"
+        );
+    }
+
+    #[test]
+    fn build_proof_no_silent_corruption_with_loader_gap() {
+        // End-to-end regression test for the silent-corruption postcondition:
+        //
+        // `build_nipopow_proof` MUST NEVER return `Ok(bytes)` where
+        // `verify_nipopow_proof_bytes(bytes)` fails. Either the build
+        // returns an `Err` (clean fail) or it returns bytes that pass
+        // verify (correct construction). There is no third state.
+        //
+        // The repro: a synthetic chain whose extension loader returns
+        // bytes for a *different* block at some heights — the same shape
+        // as enr-store's backward-walk recovery for `modifiers.redb` holes.
+        // Pre-fix this could produce a structurally invalid proof that
+        // round-trips through the serializer but fails
+        // `has_valid_connections` at verify time.
+        //
+        // Post-fix the chain reader rejects mismatched extension bytes,
+        // surfacing as a clean error from `prove_with_reader`. The build
+        // either errors or completes against a chain whose corrupted
+        // heights are simply skipped by the walk.
+        use std::sync::{Arc, Mutex};
+
+        let config = ChainConfig::testnet();
+        let mut chain = HeaderChain::new(config.clone());
+        let n_bits = config.initial_n_bits;
+
+        let count: u32 = 64;
+
+        // Build chain headers with strictly-increasing timestamps.
+        let mut headers: Vec<Header> = Vec::with_capacity(count as usize);
+        let mut prev_id = BlockId(Digest32::zero());
+        for h in 1..=count {
+            let header = make_synthetic_header(
+                h,
+                prev_id,
+                1_000_000 + (h as u64 - 1) * 45_000,
+                n_bits,
+            );
+            prev_id = header.id;
+            headers.push(header);
+        }
+
+        // Compute correct interlinks per height.
+        let mut interlinks: Vec<Vec<BlockId>> = Vec::with_capacity(headers.len());
+        for (idx, h) in headers.iter().enumerate() {
+            if idx == 0 {
+                interlinks.push(vec![h.id]);
+            } else {
+                let prev_header = &headers[idx - 1];
+                let prev_interlinks = interlinks[idx - 1].clone();
+                interlinks.push(
+                    NipopowAlgos::update_interlinks(prev_header.clone(), prev_interlinks)
+                        .expect("update_interlinks"),
+                );
+            }
+        }
+
+        // Build a corrupted store: for heights 16..=48 return the
+        // extension bytes for `height - 4` instead of `height`. The bytes
+        // are well-formed and parse cleanly through `parse_extension_bytes`
+        // — they just don't match the header at the queried height. This
+        // models enr-store returning a stale entry for a missing modifier.
+        let mut store: std::collections::HashMap<u32, Vec<u8>> =
+            std::collections::HashMap::new();
+        for (idx, h) in headers.iter().enumerate() {
+            let bytes = if h.height >= 16 && h.height <= 48 && idx >= 4 {
+                let src_idx = idx - 4;
+                let fields = NipopowAlgos::pack_interlinks(interlinks[src_idx].clone());
+                pack_extension_bytes(&headers[src_idx].id, &fields)
+            } else {
+                let fields = NipopowAlgos::pack_interlinks(interlinks[idx].clone());
+                pack_extension_bytes(&h.id, &fields)
+            };
+            store.insert(h.height, bytes);
+        }
+
+        for h in headers.into_iter() {
+            chain.try_append_no_pow(h).expect("append");
+        }
+
+        let store_arc = Arc::new(Mutex::new(store));
+        chain.set_extension_loader(move |height| {
+            store_arc.lock().unwrap().get(&height).cloned()
+        });
+
+        // Build with both anchor variants: `None` (uses last_headers) and
+        // an explicit deep anchor (uses popow_header_by_id directly). The
+        // bug affects either path through the reader.
+        for header_id_opt in [None, Some(chain.tip().id)] {
+            let result = build_nipopow_proof(&chain, 2, 2, header_id_opt);
+            match result {
+                Err(_) => {
+                    // Clean fail — acceptable.
+                }
+                Ok(bytes) => {
+                    verify_nipopow_proof_bytes_no_pow(&bytes).unwrap_or_else(|e| panic!(
+                        "build_nipopow_proof returned Ok with bytes that fail verify (silent corruption): {e:?}"
+                    ));
+                }
+            }
+        }
     }
 }
