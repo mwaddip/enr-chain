@@ -98,17 +98,18 @@ fn calculate(
     block_interval_ms: u64,
     initial_n_bits: u32,
 ) -> Result<u32, ChainError> {
-    if headers.is_empty() {
-        return Err(ChainError::DifficultyCalc(
-            "no headers for difficulty calculation".into(),
-        ));
-    }
+    let first_header = headers.first().ok_or_else(|| {
+        ChainError::DifficultyCalc("no headers for difficulty calculation".into())
+    })?;
+    let last_header = headers.last().ok_or_else(|| {
+        ChainError::DifficultyCalc("no headers for difficulty calculation".into())
+    })?;
 
     let uncompressed = if headers.len() == 1
-        || headers.first().unwrap().timestamp >= headers.last().unwrap().timestamp
+        || first_header.timestamp >= last_header.timestamp
     {
         // Single header or timestamps not increasing: return first header's difficulty
-        required_difficulty(headers[0])
+        required_difficulty(first_header)
     } else {
         // Build data points from consecutive epoch-boundary header pairs
         let desired_ms = BigInt::from(block_interval_ms) * BigInt::from(epoch_length);
@@ -172,7 +173,10 @@ fn eip37_calculate(
         ));
     }
 
-    let last_diff = required_difficulty(headers.last().unwrap());
+    let last_header = headers.last().ok_or_else(|| {
+        ChainError::DifficultyCalc("no headers for EIP-37 difficulty calculation".into())
+    })?;
+    let last_diff = required_difficulty(last_header);
 
     // Predictive difficulty via linear regression
     // calculate() returns nBits, but we need the raw BigInt for capping.
