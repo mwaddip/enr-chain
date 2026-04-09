@@ -107,21 +107,16 @@ impl VotingConfig {
     }
 }
 
-/// Steps applied to a parameter on each successful vote.
+/// Hardcoded step for a parameter, if one exists.
 ///
-/// Mirrors JVM `Parameters.stepsTable`. Indexed by absolute parameter ID
-/// (1-8). The step is added on positive vote majority and subtracted on
-/// negative.
+/// Mirrors JVM `Parameters.stepsTable`. Only 3 params have hardcoded steps;
+/// the rest use a dynamic default of `max(1, current_value / 100)`.
+/// Returns `None` for params that use the dynamic formula.
 pub fn parameter_step(id: i8) -> Option<i32> {
     match id.unsigned_abs() as i8 {
-        1 => Some(25_000),    // StorageFeeFactor
-        2 => Some(2),         // MinValuePerByte
-        3 => Some(100 * 1024), // MaxBlockSize
-        4 => Some(100_000),   // MaxBlockCost
-        5 => Some(10),        // TokenAccessCost
-        6 => Some(50),        // InputCost
-        7 => Some(10),        // DataInputCost
-        8 => Some(10),        // OutputCost
+        1 => Some(25_000), // StorageFeeFactor
+        2 => Some(10),     // MinValuePerByte
+        9 => Some(1),      // SubblocksPerBlock
         _ => None,
     }
 }
@@ -137,6 +132,7 @@ pub fn parameter_min(id: i8) -> Option<i32> {
         6 => Some(0),
         7 => Some(0),
         8 => Some(0),
+        9 => Some(2),
         _ => None,
     }
 }
@@ -144,19 +140,15 @@ pub fn parameter_min(id: i8) -> Option<i32> {
 /// Upper bound for an ordinary parameter (mirrors JVM `maxValues`).
 pub fn parameter_max(id: i8) -> Option<i32> {
     match id.unsigned_abs() as i8 {
-        1 => Some(i32::MAX),
-        2 => Some(i32::MAX),
-        3 => Some(i32::MAX),
-        4 => Some(i32::MAX),
-        5 => Some(i32::MAX),
-        6 => Some(i32::MAX),
-        7 => Some(i32::MAX),
-        8 => Some(i32::MAX),
+        1 => Some(2_500_000),     // StorageFeeFactor
+        2 => Some(10_000),        // MinValuePerByte
+        9 => Some(2_048),         // SubblocksPerBlock
+        3..=8 => Some(i32::MAX / 2),
         _ => None,
     }
 }
 
-/// Map an ordinary parameter ID (1-8) to its [`Parameter`] enum variant.
+/// Map an ordinary parameter ID (1-9) to its [`Parameter`] enum variant.
 fn ordinary_param(id: i8) -> Option<Parameter> {
     match id.unsigned_abs() as i8 {
         1 => Some(Parameter::StorageFeeFactor),
@@ -167,6 +159,7 @@ fn ordinary_param(id: i8) -> Option<Parameter> {
         6 => Some(Parameter::InputCost),
         7 => Some(Parameter::DataInputCost),
         8 => Some(Parameter::OutputCost),
+        9 => Some(Parameter::SubblocksPerBlock),
         _ => None,
     }
 }
@@ -221,15 +214,16 @@ pub(crate) const SUBBLOCKS_PER_BLOCK_DEFAULT: i32 = 30;
 ///
 /// `signed_id` is the raw byte from the header `votes` slot: positive
 /// means "increase", negative means "decrease". The step magnitude comes
-/// from [`parameter_step`], clamped by [`parameter_min`]/[`parameter_max`].
+/// from [`parameter_step`] when hardcoded, otherwise `max(1, current / 100)`.
+///
+/// Boundary logic mirrors JVM: increase only applies if `current < max`,
+/// decrease only applies if `current > min`. No clamping — the guard
+/// prevents overshooting.
 ///
 /// Returns `false` if `signed_id` is not an ordinary parameter (i.e. soft
 /// fork or unknown).
 pub(crate) fn apply_ordinary_step(table: &mut HbHashMap<Parameter, i32>, signed_id: i8) -> bool {
     let Some(param) = ordinary_param(signed_id) else {
-        return false;
-    };
-    let Some(step) = parameter_step(signed_id) else {
         return false;
     };
     let Some(min) = parameter_min(signed_id) else {
@@ -240,8 +234,13 @@ pub(crate) fn apply_ordinary_step(table: &mut HbHashMap<Parameter, i32>, signed_
     };
 
     let current = *table.get(&param).unwrap_or(&0);
-    let delta = if signed_id > 0 { step } else { -step };
-    let new_val = current.saturating_add(delta).clamp(min, max);
+    let step = parameter_step(signed_id).unwrap_or_else(|| 1.max(current / 100));
+
+    let new_val = if signed_id > 0 {
+        if current < max { current + step } else { current }
+    } else {
+        if current > min { current - step } else { current }
+    };
     table.insert(param, new_val);
     true
 }
@@ -593,12 +592,33 @@ mod tests {
     }
 
     #[test]
-    fn apply_ordinary_step_clamped_below_min() {
+    fn apply_ordinary_step_guarded_at_min() {
         let mut table: HbHashMap<Parameter, i32> = HbHashMap::new();
         table.insert(Parameter::MaxBlockSize, 16 * 1024); // at min
         let applied = apply_ordinary_step(&mut table, -3);
         assert!(applied);
-        assert_eq!(table[&Parameter::MaxBlockSize], 16 * 1024, "clamped at min");
+        assert_eq!(
+            table[&Parameter::MaxBlockSize],
+            16 * 1024,
+            "guard prevents decrease when current == min"
+        );
+    }
+
+    /// Regression: epoch 154 (height 157,696) MaxBlockCost must be 1,010,000.
+    /// The old hardcoded step of 100,000 produced 1,100,000 which disagreed
+    /// with the extension section on mainnet.
+    #[test]
+    fn apply_ordinary_step_max_block_cost_dynamic() {
+        let mut table: HbHashMap<Parameter, i32> = HbHashMap::new();
+        table.insert(Parameter::MaxBlockCost, 1_000_000);
+        let applied = apply_ordinary_step(&mut table, 4); // increase MaxBlockCost
+        assert!(applied);
+        // Dynamic step: max(1, 1_000_000 / 100) = 10_000
+        assert_eq!(
+            table[&Parameter::MaxBlockCost],
+            1_010_000,
+            "dynamic step = max(1, current/100) = 10,000"
+        );
     }
 
     #[test]
