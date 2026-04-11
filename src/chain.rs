@@ -272,29 +272,54 @@ impl HeaderChain {
         self.extension_loader.as_ref()
     }
 
-    /// Walk back to the most recent epoch boundary, parse parameters from
-    /// its extension, and set as active.
+    /// Load the parameters in effect at `target_height` from storage.
     ///
-    /// Called at startup after wiring the extension loader. If the chain
-    /// is shorter than one voting epoch (no boundary block exists yet),
-    /// returns `Ok(())` and leaves [`Self::active_parameters`] at the
-    /// chain-internal defaults.
+    /// Picks the most recent epoch-boundary block at or before
+    /// `target_height`, reads its extension via the registered loader,
+    /// parses the parameters, and installs them as
+    /// [`Self::active_parameters`].
     ///
-    /// Errors if:
-    /// - The loader is set but returns `None` for the boundary height
+    /// `target_height` is the height the validator is about to resume
+    /// validating from — typically far behind the chain tip on a fresh
+    /// resync, identical to the chain tip on a normal restart. Using the
+    /// validator's resume height (rather than the chain tip) is what makes
+    /// a fresh genesis resync against a chain whose tip carries v6-era
+    /// parameters validate the v1-era epoch boundaries correctly: at
+    /// `target_height = 0`, no boundary exists at or before, so
+    /// `active_parameters` stays at the chain-internal defaults and the
+    /// first epoch-boundary block (mainnet 1024) is computed against the
+    /// v1 table the chain genuinely expects.
+    ///
+    /// Behavior by `target_height`:
+    /// - `target_height < voting_length` → no-op success;
+    ///   `active_parameters` is left at the construction defaults. The
+    ///   loader is NOT consulted (no boundary block exists at or before).
+    /// - `target_height ∈ [k*voting_length, (k+1)*voting_length - 1]` for
+    ///   `k ≥ 1` → loads the extension at height `k*voting_length`.
+    ///
+    /// Errors if (and only if a load is required):
+    /// - The loader is unset
+    /// - The loader returns `None` for the boundary height
     /// - The extension bytes fail to parse
-    /// - The parsed parameters are malformed
+    /// - The boundary header is missing from the chain (caller misuse:
+    ///   `target_height` points past the chain's known headers)
+    /// - The extension's `header_id` field disagrees with the chain
     ///
     /// Cost: bounded — at most one extension read. Acceptable at startup.
-    pub fn recompute_active_parameters_from_storage(&mut self) -> Result<(), ChainError> {
+    pub fn recompute_active_parameters_from_storage(
+        &mut self,
+        target_height: u32,
+    ) -> Result<(), ChainError> {
         let voting_length = self.config.voting.voting_length;
-        let tip_height = self.height();
-        if tip_height < voting_length {
-            // Chain shorter than one epoch — no boundary block to read.
+        if target_height < voting_length {
+            // No epoch boundary exists at or before `target_height`.
+            // Leave `active_parameters` at construction defaults.
             return Ok(());
         }
-        let boundary_height = (tip_height / voting_length) * voting_length;
+        let boundary_height = (target_height / voting_length) * voting_length;
         if boundary_height == 0 {
+            // Defensive: voting_length must be > 0 by config invariant, so
+            // this is unreachable, but we keep the guard cheap.
             return Ok(());
         }
 

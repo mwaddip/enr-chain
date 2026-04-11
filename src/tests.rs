@@ -1760,7 +1760,8 @@ mod voting_chain_tests {
     fn recompute_with_no_loader_errors() {
         let mut chain = HeaderChain::new(testnet_config());
         // Chain has tip at 0, no loader → error path covered.
-        let r = chain.recompute_active_parameters_from_storage();
+        let tip = chain.height();
+        let r = chain.recompute_active_parameters_from_storage(tip);
         // With no loader and no boundary block needed (empty chain), should be Ok
         // because nothing to do.
         assert!(r.is_ok());
@@ -1785,7 +1786,8 @@ mod voting_chain_tests {
             chain.try_append_no_pow(header).unwrap();
         }
 
-        chain.recompute_active_parameters_from_storage().unwrap();
+        let tip = chain.height();
+        chain.recompute_active_parameters_from_storage(tip).unwrap();
         // Defaults preserved (testnet starts at v4)
         assert_eq!(chain.active_parameters().block_version(), 4);
     }
@@ -1836,7 +1838,8 @@ mod voting_chain_tests {
             }
         });
 
-        chain.recompute_active_parameters_from_storage().unwrap();
+        let tip = chain.height();
+        chain.recompute_active_parameters_from_storage(tip).unwrap();
         assert_eq!(chain.active_parameters().storage_fee_factor(), 1_300_000);
         assert_eq!(chain.active_parameters().block_version(), 2);
     }
@@ -1859,7 +1862,8 @@ mod voting_chain_tests {
         }
 
         chain.set_extension_loader(|_| None);
-        let r = chain.recompute_active_parameters_from_storage();
+        let tip = chain.height();
+        let r = chain.recompute_active_parameters_from_storage(tip);
         assert!(r.is_err());
     }
 
@@ -1881,7 +1885,8 @@ mod voting_chain_tests {
         }
 
         chain.set_extension_loader(|_| Some(vec![0xAB; 5])); // Too short
-        let r = chain.recompute_active_parameters_from_storage();
+        let tip = chain.height();
+        let r = chain.recompute_active_parameters_from_storage(tip);
         assert!(r.is_err());
     }
 
@@ -1920,7 +1925,8 @@ mod voting_chain_tests {
             }
         });
 
-        let r = chain.recompute_active_parameters_from_storage();
+        let tip = chain.height();
+        let r = chain.recompute_active_parameters_from_storage(tip);
         assert!(r.is_err());
         let msg = format!("{}", r.unwrap_err());
         assert!(msg.contains("mismatch"), "expected mismatch error, got: {msg}");
@@ -2057,7 +2063,8 @@ mod voting_chain_tests {
             }
         });
 
-        chain.recompute_active_parameters_from_storage().unwrap();
+        let tip = chain.height();
+        chain.recompute_active_parameters_from_storage(tip).unwrap();
         assert_eq!(
             chain.active_disabling_rules(),
             &disabling_rules_bytes[..],
@@ -2138,6 +2145,181 @@ mod voting_chain_tests {
             Some(30),
             "auto-insert at BlockVersion==4 must populate SubblocksPerBlock=30"
         );
+    }
+
+    // ---- Target-height-aware recompute tests ----
+    //
+    // The validator's resume height (the height it's about to start
+    // re-validating from) is generally far behind the chain tip on a fresh
+    // resync. The active parameters table at startup must reflect the
+    // parameters in effect at *that* height, not at the chain tip — otherwise
+    // a fresh genesis resync against a chain whose tip carries v6-era
+    // parameters fails the very first epoch boundary because the locally
+    // computed expected table has more entries than the v1-era extension.
+
+    /// Build a synthetic extension at the given boundary height carrying a
+    /// distinct StorageFeeFactor value, so tests can tell which boundary
+    /// the recompute actually loaded from.
+    fn extension_with_storage_fee(
+        chain: &HeaderChain,
+        boundary_height: u32,
+        storage_fee: i32,
+    ) -> Vec<u8> {
+        use crate::voting::{pack_extension_bytes, pack_parameters_to_kv};
+        use std::collections::HashMap;
+
+        let mut params: HashMap<i8, i32> = HashMap::new();
+        params.insert(1, storage_fee);
+        params.insert(2, 360);
+        params.insert(3, 524_288);
+        params.insert(4, 1_000_000);
+        params.insert(5, 100);
+        params.insert(6, 2_000);
+        params.insert(7, 100);
+        params.insert(8, 100);
+        params.insert(123, 4);
+
+        let kv = pack_parameters_to_kv(&params);
+        let header_id = chain
+            .header_at(boundary_height)
+            .expect("test setup: chain must contain the boundary height")
+            .id;
+        pack_extension_bytes(&header_id, &kv)
+    }
+
+    #[test]
+    fn recompute_target_zero_keeps_defaults_loader_not_called() {
+        // Even with a chain spanning multiple epoch boundaries, target=0
+        // means "the validator has applied nothing yet" → no boundary at or
+        // before that height → defaults stand. The loader must not be
+        // consulted because there is nothing to load.
+        let mut chain = build_chain_with_votes(260, [0, 0, 0]);
+        chain.set_extension_loader(|_| panic!("loader must not be called for target=0"));
+
+        chain
+            .recompute_active_parameters_from_storage(0)
+            .expect("target=0 must be a no-op success");
+
+        // Defaults preserved (testnet starts with the chain-internal defaults).
+        assert_eq!(chain.active_parameters().storage_fee_factor(), 1_250_000);
+    }
+
+    #[test]
+    fn recompute_target_just_below_first_boundary_keeps_defaults() {
+        // target = voting_length - 1 (=127). Still no boundary at or before
+        // that height. Defaults stand, loader not called.
+        let mut chain = build_chain_with_votes(260, [0, 0, 0]);
+        chain.set_extension_loader(|_| {
+            panic!("loader must not be called below the first boundary")
+        });
+
+        chain
+            .recompute_active_parameters_from_storage(127)
+            .expect("target below first boundary must be a no-op");
+
+        assert_eq!(chain.active_parameters().storage_fee_factor(), 1_250_000);
+    }
+
+    #[test]
+    fn recompute_target_at_first_boundary_loads_first_boundary() {
+        // target = 128 → boundary at 128 → loads the params from that
+        // extension. Verify by parking a distinct StorageFeeFactor in the
+        // synthetic extension at h=128.
+        let mut chain = build_chain_with_votes(260, [0, 0, 0]);
+        let ext_128 = extension_with_storage_fee(&chain, 128, 1_300_000);
+        chain.set_extension_loader(move |h| {
+            if h == 128 {
+                Some(ext_128.clone())
+            } else {
+                None
+            }
+        });
+
+        chain
+            .recompute_active_parameters_from_storage(128)
+            .expect("target at first boundary must load");
+
+        assert_eq!(chain.active_parameters().storage_fee_factor(), 1_300_000);
+    }
+
+    #[test]
+    fn recompute_target_just_above_first_boundary_loads_first_boundary() {
+        // target = 129 → most recent boundary ≤ 129 is 128.
+        let mut chain = build_chain_with_votes(260, [0, 0, 0]);
+        let ext_128 = extension_with_storage_fee(&chain, 128, 1_300_000);
+        chain.set_extension_loader(move |h| {
+            if h == 128 {
+                Some(ext_128.clone())
+            } else {
+                None
+            }
+        });
+
+        chain
+            .recompute_active_parameters_from_storage(129)
+            .expect("target just above first boundary must load 128");
+
+        assert_eq!(chain.active_parameters().storage_fee_factor(), 1_300_000);
+    }
+
+    #[test]
+    fn recompute_target_just_below_second_boundary_loads_first_boundary() {
+        // target = 255 → most recent boundary ≤ 255 is 128, NOT 256.
+        // Even though the chain has the header at h=256, the function must
+        // not "round up" to the next boundary.
+        let mut chain = build_chain_with_votes(260, [0, 0, 0]);
+        let ext_128 = extension_with_storage_fee(&chain, 128, 1_300_000);
+        // Loader at 256 returns garbage to ensure it is NOT consulted.
+        chain.set_extension_loader(move |h| match h {
+            128 => Some(ext_128.clone()),
+            256 => panic!("must not load boundary 256 when target is 255"),
+            _ => None,
+        });
+
+        chain
+            .recompute_active_parameters_from_storage(255)
+            .expect("target just below second boundary must load 128");
+
+        assert_eq!(chain.active_parameters().storage_fee_factor(), 1_300_000);
+    }
+
+    #[test]
+    fn recompute_target_at_second_boundary_loads_second_boundary() {
+        // target = 256 → boundary at 256, NOT 128. Verified by giving the
+        // two boundaries different StorageFeeFactor values.
+        let mut chain = build_chain_with_votes(260, [0, 0, 0]);
+        let ext_128 = extension_with_storage_fee(&chain, 128, 1_300_000);
+        let ext_256 = extension_with_storage_fee(&chain, 256, 1_400_000);
+        chain.set_extension_loader(move |h| match h {
+            128 => Some(ext_128.clone()),
+            256 => Some(ext_256.clone()),
+            _ => None,
+        });
+
+        chain
+            .recompute_active_parameters_from_storage(256)
+            .expect("target at second boundary must load 256");
+
+        assert_eq!(chain.active_parameters().storage_fee_factor(), 1_400_000);
+    }
+
+    #[test]
+    fn recompute_target_above_second_boundary_loads_second_boundary() {
+        // target = 260 → most recent boundary ≤ 260 is 256.
+        let mut chain = build_chain_with_votes(260, [0, 0, 0]);
+        let ext_128 = extension_with_storage_fee(&chain, 128, 1_300_000);
+        let ext_256 = extension_with_storage_fee(&chain, 256, 1_400_000);
+        chain.set_extension_loader(move |h| match h {
+            128 => Some(ext_128.clone()),
+            256 => Some(ext_256.clone()),
+            _ => None,
+        });
+
+        chain
+            .recompute_active_parameters_from_storage(260)
+            .expect("target above second boundary must load 256");
+
+        assert_eq!(chain.active_parameters().storage_fee_factor(), 1_400_000);
     }
 }
 
