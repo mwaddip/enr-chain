@@ -209,12 +209,16 @@ impl HeaderChain {
     /// cache is write-through on push, so the tip is always
     /// freshly resident).
     pub fn tip(&self) -> Header {
-        let tip_height = self
-            .base_height
-            .map(|b| b + (self.scores.len() as u32) - 1)
-            .expect("tip() called on empty chain");
+        if self.is_empty() {
+            panic!("tip() called on empty chain");
+        }
+        // Delegate to `height()` instead of recomputing `base +
+        // scores.len() - 1` here — that arithmetic only holds under
+        // the `base_height.is_some() iff !scores.is_empty()`
+        // invariant; routing through `height()` makes the empty-path
+        // guard explicit at every caller.
         self.lazy
-            .get_header(tip_height)
+            .get_header(self.height())
             .expect("tip header unavailable — cache evicted with no loader wired")
     }
 

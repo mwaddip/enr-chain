@@ -384,6 +384,16 @@ mod chain_tests {
     }
 
     #[test]
+    #[should_panic(expected = "tip() called on empty chain")]
+    fn tip_panics_on_empty_chain() {
+        // Guard the invariant that tip() surfaces emptiness cleanly,
+        // not via arithmetic underflow on `base_height + scores.len()
+        // - 1`.
+        let chain = HeaderChain::new(testnet_config());
+        let _ = chain.tip();
+    }
+
+    #[test]
     fn append_genesis() {
         let config = testnet_config();
         let mut chain = HeaderChain::new(config.clone());
