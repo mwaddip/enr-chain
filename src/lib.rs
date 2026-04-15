@@ -4,6 +4,7 @@
 //! Phase 2: Verify proof of work before accepting headers.
 //! Phase 3: Validate headers form a correct chain (parent, timestamp, difficulty).
 
+pub(crate) mod cache;
 mod chain;
 mod config;
 pub(crate) mod difficulty;
@@ -18,6 +19,7 @@ mod tests;
 mod tracker;
 mod voting;
 
+pub use cache::{HeaderLoader, ScoreLoader, DEFAULT_CACHE_CAPACITY};
 pub use chain::{AppendResult, HeaderChain};
 pub use config::{ChainConfig, Network};
 pub use ergo_chain_types::autolykos_pow_scheme::decode_compact_bits;

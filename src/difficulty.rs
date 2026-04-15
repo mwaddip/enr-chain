@@ -35,15 +35,19 @@ pub fn expected_difficulty(parent: &Header, chain: &HeaderChain) -> Result<u32, 
             epoch_length,
             config.use_last_epochs,
         );
-        let headers: Vec<&Header> = heights
+        // `chain.header_at` returns owned headers post-Phase-2; collect
+        // first, then borrow into the ref-slice shape the inner helpers
+        // still expect.
+        let owned_headers: Vec<Header> = heights
             .iter()
             .filter_map(|&h| chain.header_at(h))
             .collect();
 
-        if headers.is_empty() {
+        if owned_headers.is_empty() {
             return Ok(config.initial_n_bits);
         }
 
+        let headers: Vec<&Header> = owned_headers.iter().collect();
         if config.eip37_active(parent.height + 1) {
             eip37_calculate(&headers, epoch_length, config.block_interval_ms, config.initial_n_bits)
         } else {

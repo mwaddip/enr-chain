@@ -529,7 +529,7 @@ mod chain_tests {
 
         for h in 2..=10 {
             let tip = chain.tip();
-            let expected_n_bits = crate::difficulty::expected_difficulty(tip, &chain).unwrap();
+            let expected_n_bits = crate::difficulty::expected_difficulty(&tip, &chain).unwrap();
             let header = make_chain_header(h, tip.id, 1_000_000 + h as u64 * 45_000, expected_n_bits);
             chain.try_append_no_pow(header).unwrap();
         }
@@ -551,7 +551,7 @@ mod chain_tests {
 
         for h in 2..=10 {
             let tip = chain.tip();
-            let expected_n_bits = crate::difficulty::expected_difficulty(tip, &chain).unwrap();
+            let expected_n_bits = crate::difficulty::expected_difficulty(&tip, &chain).unwrap();
             let header = make_chain_header(h, tip.id, 1_000_000 + h as u64 * 45_000, expected_n_bits);
             chain.try_append_no_pow(header).unwrap();
         }
@@ -648,7 +648,7 @@ mod chain_tests {
         // with only one epoch of data, which returns the same difficulty).
         let parent = chain.tip();
         let expected_n_bits =
-            crate::difficulty::expected_difficulty(parent, &chain).unwrap();
+            crate::difficulty::expected_difficulty(&parent, &chain).unwrap();
 
         let header129 = make_chain_header(
             129,
@@ -733,7 +733,7 @@ mod reorg_tests {
 
         for h in 2..=count {
             let tip = chain.tip();
-            let expected_n_bits = crate::difficulty::expected_difficulty(tip, &chain).unwrap();
+            let expected_n_bits = crate::difficulty::expected_difficulty(&tip, &chain).unwrap();
             let header = make_chain_header(h, tip.id, 1_000_000 + (h as u64 - 1) * 45_000, expected_n_bits);
             chain.try_append_no_pow(header).unwrap();
         }
@@ -924,7 +924,7 @@ mod sync_info_tests {
         for h in 2..=count {
             let parent = chain.tip();
             let expected_n_bits =
-                crate::difficulty::expected_difficulty(parent, &chain).unwrap();
+                crate::difficulty::expected_difficulty(&parent, &chain).unwrap();
             let timestamp = 1_000_000 + (h as u64 - 1) * 45_000;
             let header = make_chain_header(h, prev_id, timestamp, expected_n_bits);
             prev_id = header.id;
@@ -1260,7 +1260,7 @@ mod score_and_deep_reorg_tests {
         chain.try_append_no_pow(genesis).unwrap();
         for h in 2..=count {
             let tip = chain.tip();
-            let expected_n_bits = crate::difficulty::expected_difficulty(tip, &chain).unwrap();
+            let expected_n_bits = crate::difficulty::expected_difficulty(&tip, &chain).unwrap();
             let header = make_chain_header(h, tip.id, 1_000_000 + (h as u64 - 1) * 45_000, expected_n_bits);
             chain.try_append_no_pow(header).unwrap();
         }
@@ -1501,7 +1501,7 @@ mod voting_chain_tests {
 
         for h in 2..=count {
             let tip = chain.tip();
-            let expected_n_bits = crate::difficulty::expected_difficulty(tip, &chain).unwrap();
+            let expected_n_bits = crate::difficulty::expected_difficulty(&tip, &chain).unwrap();
             let header = make_header_with_votes(
                 h,
                 prev_id,
@@ -2437,7 +2437,7 @@ mod light_client_install_tests {
         assert_eq!(chain.tip().id, last_id);
         assert!(chain.light_client_mode());
         // scores[0] = 0 — see Phase 6 doc on cumulative-difficulty meaninglessness.
-        assert_eq!(*chain.score_at(1000).unwrap(), num_bigint::BigUint::ZERO);
+        assert_eq!(chain.score_at(1000).unwrap(), num_bigint::BigUint::ZERO);
     }
 
     #[test]
@@ -2707,3 +2707,355 @@ mod light_client_install_tests {
         assert!(chain.light_client_mode());
     }
 }
+
+#[cfg(test)]
+mod lazy_cache_tests {
+    use std::num::NonZeroUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use ergo_chain_types::*;
+    use num_bigint::BigUint;
+    use sigma_ser::ScorexSerializable;
+
+    use crate::{ChainConfig, HeaderChain};
+
+    fn testnet_config() -> ChainConfig {
+        ChainConfig::testnet()
+    }
+
+    fn genesis_parent_id() -> BlockId {
+        BlockId(Digest32::zero())
+    }
+
+    /// Synthetic header builder — no real PoW, id computed via
+    /// serialization roundtrip so each (height, parent_id, timestamp,
+    /// n_bits) tuple yields a distinct, deterministic id.
+    fn make_header(
+        height: u32,
+        parent_id: BlockId,
+        timestamp: u64,
+        n_bits: u32,
+    ) -> Header {
+        let zero32 = Digest32::zero();
+        let mut header = Header {
+            version: 2,
+            id: BlockId(Digest32::zero()),
+            parent_id,
+            ad_proofs_root: zero32,
+            state_root: ADDigest::zero(),
+            transaction_root: zero32,
+            timestamp,
+            n_bits,
+            height,
+            extension_root: zero32,
+            autolykos_solution: AutolykosSolution {
+                miner_pk: Box::new(EcPoint::default()),
+                pow_onetime_pk: None,
+                nonce: height.to_be_bytes().repeat(2),
+                pow_distance: None,
+            },
+            votes: Votes([0, 0, 0]),
+            unparsed_bytes: Box::new([]),
+        };
+        let bytes = header.scorex_serialize_bytes().unwrap();
+        let reparsed = Header::scorex_parse_bytes(&bytes).unwrap();
+        header.id = reparsed.id;
+        header
+    }
+
+    /// Push `count` sequential headers starting from genesis. Returns
+    /// the headers for convenient inspection.
+    fn build_chain(chain: &mut HeaderChain, count: u32) -> Vec<Header> {
+        let config = chain.config().clone();
+        let genesis = make_header(1, genesis_parent_id(), 1_000_000, config.initial_n_bits);
+        let mut prev_id = genesis.id;
+        let n_bits = genesis.n_bits;
+        let mut built = vec![genesis.clone()];
+        chain.try_append_no_pow(genesis).unwrap();
+        for h in 2..=count {
+            let hdr = make_header(h, prev_id, 1_000_000 + h as u64 * 45_000, n_bits);
+            prev_id = hdr.id;
+            built.push(hdr.clone());
+            chain.try_append_no_pow(hdr).unwrap();
+        }
+        built
+    }
+
+    #[test]
+    fn push_writes_through_to_cache() {
+        let mut chain = HeaderChain::new(testnet_config());
+        let built = build_chain(&mut chain, 5);
+
+        for (i, expected) in built.iter().enumerate() {
+            let h = (i + 1) as u32;
+            let cached = chain
+                .lazy()
+                .peek_header(h)
+                .unwrap_or_else(|| panic!("cache missing height {h}"));
+            assert_eq!(cached.id, expected.id, "height {h} header id mismatch");
+        }
+        // Scores are cumulative — we don't compare exact values here;
+        // just assert they exist at every height that was pushed.
+        for h in 1..=5 {
+            assert!(chain.lazy().peek_score(h).is_some(), "score cache missing height {h}");
+        }
+        assert_eq!(chain.lazy().header_cache_len(), 5);
+        assert_eq!(chain.lazy().score_cache_len(), 5);
+    }
+
+    #[test]
+    fn miss_without_loader_returns_none() {
+        let chain = HeaderChain::new(testnet_config());
+        assert!(chain.lazy().get_header(99).is_none());
+        assert!(chain.lazy().get_score(99).is_none());
+        assert!(!chain.has_header_loader());
+        assert!(!chain.has_score_loader());
+    }
+
+    #[test]
+    fn miss_consults_header_loader_once_then_caches() {
+        let mut chain = HeaderChain::new(testnet_config());
+        let synth = make_header(42, genesis_parent_id(), 1_234_567, 16842752);
+        let synth_id = synth.id;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_hot = calls.clone();
+        chain.set_header_loader(move |h| {
+            calls_hot.fetch_add(1, Ordering::SeqCst);
+            if h == 42 {
+                Some(synth.clone())
+            } else {
+                None
+            }
+        });
+        assert!(chain.has_header_loader());
+
+        // First call: cache miss, loader invoked.
+        let got = chain.lazy().get_header(42).expect("loader should return");
+        assert_eq!(got.id, synth_id);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Second call: cache hit, loader NOT invoked again.
+        let got2 = chain.lazy().get_header(42).expect("cache hit");
+        assert_eq!(got2.id, synth_id);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Unknown height: loader says None, no cache insertion.
+        assert!(chain.lazy().get_header(999).is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(chain.lazy().peek_header(999).is_none());
+    }
+
+    #[test]
+    fn miss_consults_score_loader_once_then_caches() {
+        let mut chain = HeaderChain::new(testnet_config());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_hot = calls.clone();
+        chain.set_score_loader(move |h| {
+            calls_hot.fetch_add(1, Ordering::SeqCst);
+            if h == 10 { Some(BigUint::from(7u32)) } else { None }
+        });
+        assert!(chain.has_score_loader());
+
+        let s = chain.lazy().get_score(10).unwrap();
+        assert_eq!(s, BigUint::from(7u32));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let s2 = chain.lazy().get_score(10).unwrap();
+        assert_eq!(s2, BigUint::from(7u32));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn lru_evicts_oldest_at_capacity() {
+        let mut chain = HeaderChain::new(testnet_config());
+        // Shrink both caches to 3 entries before pushing anything.
+        chain.set_cache_capacity(NonZeroUsize::new(3).unwrap());
+        build_chain(&mut chain, 5);
+
+        // Oldest two (heights 1, 2) evicted; three most recent (3, 4, 5)
+        // retained.
+        assert!(chain.lazy().peek_header(1).is_none());
+        assert!(chain.lazy().peek_header(2).is_none());
+        assert!(chain.lazy().peek_header(3).is_some());
+        assert!(chain.lazy().peek_header(4).is_some());
+        assert!(chain.lazy().peek_header(5).is_some());
+        assert_eq!(chain.lazy().header_cache_len(), 3);
+
+        // Score cache tracks the same eviction order.
+        assert!(chain.lazy().peek_score(1).is_none());
+        assert!(chain.lazy().peek_score(2).is_none());
+        assert_eq!(chain.lazy().score_cache_len(), 3);
+    }
+
+    #[test]
+    fn reorg_drain_evicts_cache_and_restores_on_rollback() {
+        let config = testnet_config();
+        let mut chain = HeaderChain::new(config.clone());
+        let built = build_chain(&mut chain, 5);
+
+        // Attempt a deep reorg with a deliberately-broken branch so it
+        // fails validation and triggers rollback restoration. Fork at
+        // height 3: new branch replaces heights 4 and 5. We sabotage
+        // it by giving the first new header a wrong parent_id so the
+        // reorg errors out during validation.
+        let fork_parent = &built[2]; // height 3
+        let bad_first = make_header(
+            4,
+            BlockId(Digest32::from([0xaa; 32])), // wrong parent
+            fork_parent.timestamp + 1000,
+            fork_parent.n_bits,
+        );
+        let err = chain
+            .try_reorg_deep_no_pow(3, vec![bad_first])
+            .unwrap_err();
+        // We don't care which error variant — just that it failed and
+        // rolled back.
+        drop(err);
+
+        // After rollback, heights 4 and 5 are back in cache (restored
+        // via `lazy.put`) and the chain looks untouched.
+        assert_eq!(chain.height(), 5);
+        assert!(chain.lazy().peek_header(4).is_some());
+        assert!(chain.lazy().peek_header(5).is_some());
+        assert_eq!(chain.lazy().peek_header(5).unwrap().id, built[4].id);
+    }
+
+    #[test]
+    fn successful_reorg_evicts_old_and_caches_new() {
+        let config = testnet_config();
+        let mut chain = HeaderChain::new(config.clone());
+        let built = build_chain(&mut chain, 5);
+        let old_height_4_id = built[3].id;
+        let old_height_5_id = built[4].id;
+
+        let fork_parent = &built[2]; // height 3
+        let new4 = make_header(
+            4,
+            fork_parent.id,
+            fork_parent.timestamp + 9_999,
+            fork_parent.n_bits,
+        );
+        let new5 = make_header(
+            5,
+            new4.id,
+            new4.timestamp + 45_000,
+            new4.n_bits,
+        );
+        let new4_id = new4.id;
+        let new5_id = new5.id;
+
+        chain
+            .try_reorg_deep_no_pow(3, vec![new4, new5])
+            .expect("reorg should succeed");
+
+        // Old tip headers got evicted then replaced by the new ones.
+        let cached4 = chain.lazy().peek_header(4).expect("new h=4 cached");
+        let cached5 = chain.lazy().peek_header(5).expect("new h=5 cached");
+        assert_eq!(cached4.id, new4_id);
+        assert_eq!(cached5.id, new5_id);
+        assert_ne!(cached4.id, old_height_4_id);
+        assert_ne!(cached5.id, old_height_5_id);
+    }
+
+    #[test]
+    fn rollback_install_clears_cache() {
+        let mut chain = HeaderChain::new(testnet_config());
+        // Install a valid head followed by a bogus tail header whose
+        // parent_id doesn't link to the head → triggers rollback.
+        let head = make_header(1000, BlockId(Digest32::from([7u8; 32])), 50_000_000, 16842752);
+        let bogus_tail = make_header(
+            1001,
+            BlockId(Digest32::from([0xff; 32])), // wrong parent
+            50_000_045,
+            16842752,
+        );
+        let err = chain
+            .install_from_nipopow_proof_no_pow(head, vec![bogus_tail])
+            .unwrap_err();
+        drop(err);
+
+        // Cache should be empty, matching by_height/by_id/scores.
+        assert_eq!(chain.lazy().header_cache_len(), 0);
+        assert_eq!(chain.lazy().score_cache_len(), 0);
+        assert!(chain.is_empty());
+    }
+
+    #[test]
+    fn public_header_at_falls_back_to_vec_under_cache_eviction() {
+        // Phase 2 invariant: reads still return correct values for
+        // evicted heights even with no loader wired (the Vec safety
+        // net carries the answer).
+        let mut chain = HeaderChain::new(testnet_config());
+        chain.set_cache_capacity(NonZeroUsize::new(2).unwrap());
+        let built = build_chain(&mut chain, 5);
+
+        // Heights 1-3 are evicted from the cache (cap=2, we pushed 5).
+        assert!(chain.lazy().peek_header(1).is_none());
+        assert!(chain.lazy().peek_header(2).is_none());
+        assert!(chain.lazy().peek_header(3).is_none());
+
+        // But the public API still answers correctly for every height.
+        for (i, expected) in built.iter().enumerate() {
+            let h = (i + 1) as u32;
+            let got = chain.header_at(h).expect("Vec fallback must cover every in-chain height");
+            assert_eq!(got.id, expected.id);
+        }
+        // tip() and headers_from() see the same safety net.
+        assert_eq!(chain.tip().id, built[4].id);
+        let slice = chain.headers_from(1, 5);
+        assert_eq!(slice.len(), 5);
+        assert_eq!(slice[0].id, built[0].id);
+        assert_eq!(slice[4].id, built[4].id);
+    }
+
+    #[test]
+    fn public_header_at_consults_loader_on_cache_miss() {
+        // Phase 2 invariant: when cache misses and a loader IS wired,
+        // the loader answers (no fallback to Vec needed in production).
+        let mut chain = HeaderChain::new(testnet_config());
+        chain.set_cache_capacity(NonZeroUsize::new(2).unwrap());
+        let built = build_chain(&mut chain, 5);
+        let loader_source = built.clone();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_hot = calls.clone();
+        chain.set_header_loader(move |h| {
+            calls_hot.fetch_add(1, Ordering::SeqCst);
+            loader_source.get((h - 1) as usize).cloned()
+        });
+
+        // Height 1 is evicted → loader fires exactly once.
+        let got = chain.header_at(1).expect("loader returns Some");
+        assert_eq!(got.id, built[0].id);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Second read at same height: cache hit, loader quiet.
+        let _ = chain.header_at(1).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Height 5 (tip) is resident → loader not consulted.
+        let _ = chain.header_at(5).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn successful_install_caches_suffix_head_with_zero_score() {
+        let mut chain = HeaderChain::new(testnet_config());
+        let head = make_header(1000, BlockId(Digest32::from([7u8; 32])), 50_000_000, 16842752);
+        let head_id = head.id;
+        chain
+            .install_from_nipopow_proof_no_pow(head, vec![])
+            .expect("install should succeed");
+
+        let cached = chain.lazy().peek_header(1000).expect("head must be cached");
+        assert_eq!(cached.id, head_id);
+        // Per the install contract, scores[0] = 0.
+        assert_eq!(
+            chain.lazy().peek_score(1000).unwrap(),
+            BigUint::ZERO,
+            "install-boundary score must be zero in cache"
+        );
+    }
+}
+

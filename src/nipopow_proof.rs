@@ -102,7 +102,7 @@ impl<'a> PopowHeaderReader for ChainPopowReader<'a> {
     }
 
     fn popow_header_at_height(&self, height: u32) -> Option<PoPowHeader> {
-        let header = self.chain.header_at(height)?.clone();
+        let header = self.chain.header_at(height)?;
 
         // Genesis: synthesize in-process. NEVER call the loader for h=1 —
         // real genesis extensions are empty and would produce empty
@@ -151,11 +151,7 @@ impl<'a> PopowHeaderReader for ChainPopowReader<'a> {
             return Vec::new();
         }
         let start = height - k_u32 + 1;
-        self.chain
-            .headers_from(start, k)
-            .into_iter()
-            .cloned()
-            .collect()
+        self.chain.headers_from(start, k)
     }
 
     fn best_headers_after(&self, header: &Header, n: usize) -> Vec<Header> {
@@ -166,11 +162,7 @@ impl<'a> PopowHeaderReader for ChainPopowReader<'a> {
             Some(s) => s,
             None => return Vec::new(),
         };
-        self.chain
-            .headers_from(start, n)
-            .into_iter()
-            .cloned()
-            .collect()
+        self.chain.headers_from(start, n)
     }
 }
 
