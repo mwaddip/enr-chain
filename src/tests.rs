@@ -2975,17 +2975,18 @@ mod lazy_cache_tests {
             .unwrap_err();
         drop(err);
 
-        // Cache should be empty, matching by_height/by_id/scores.
+        // Cache should be empty, matching by_id/scores/base_height.
         assert_eq!(chain.lazy().header_cache_len(), 0);
         assert_eq!(chain.lazy().score_cache_len(), 0);
         assert!(chain.is_empty());
     }
 
     #[test]
-    fn public_header_at_falls_back_to_vec_under_cache_eviction() {
-        // Phase 2 invariant: reads still return correct values for
-        // evicted heights even with no loader wired (the Vec safety
-        // net carries the answer).
+    fn public_header_at_returns_none_for_evicted_heights_without_loader() {
+        // Phase 3 invariant: the in-memory Vec<Header> safety net is
+        // retired. With no loader wired, reads for evicted heights
+        // resolve to None — this is the honest signal that the
+        // integrator hasn't wired persistent storage.
         let mut chain = HeaderChain::new(testnet_config());
         chain.set_cache_capacity(NonZeroUsize::new(2).unwrap());
         let built = build_chain(&mut chain, 5);
@@ -2995,18 +2996,22 @@ mod lazy_cache_tests {
         assert!(chain.lazy().peek_header(2).is_none());
         assert!(chain.lazy().peek_header(3).is_none());
 
-        // But the public API still answers correctly for every height.
-        for (i, expected) in built.iter().enumerate() {
-            let h = (i + 1) as u32;
-            let got = chain.header_at(h).expect("Vec fallback must cover every in-chain height");
-            assert_eq!(got.id, expected.id);
-        }
-        // tip() and headers_from() see the same safety net.
+        // Public API for evicted heights → None.
+        assert!(chain.header_at(1).is_none());
+        assert!(chain.header_at(2).is_none());
+        assert!(chain.header_at(3).is_none());
+
+        // Tip and penultimate are still resident, reads succeed.
+        assert_eq!(chain.header_at(4).unwrap().id, built[3].id);
+        assert_eq!(chain.header_at(5).unwrap().id, built[4].id);
         assert_eq!(chain.tip().id, built[4].id);
+
+        // `headers_from` inherits the same behavior — `filter_map`
+        // drops the Nones, so the returned slice is short.
         let slice = chain.headers_from(1, 5);
-        assert_eq!(slice.len(), 5);
-        assert_eq!(slice[0].id, built[0].id);
-        assert_eq!(slice[4].id, built[4].id);
+        assert_eq!(slice.len(), 2, "only cached heights survive");
+        assert_eq!(slice[0].id, built[3].id);
+        assert_eq!(slice[1].id, built[4].id);
     }
 
     #[test]
