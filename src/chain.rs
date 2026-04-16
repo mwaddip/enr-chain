@@ -10,7 +10,7 @@ use num_bigint::BigUint;
 use crate::cache::LazyHeaderStore;
 use crate::config::ChainConfig;
 use crate::error::ChainError;
-use crate::voting::{default_parameters, SOFT_FORK_VOTE};
+use crate::voting::{default_parameters, default_proposed_update_bytes, SOFT_FORK_VOTE};
 
 /// Map a signed parameter ID (1-8) to its [`Parameter`] enum variant.
 ///
@@ -87,14 +87,27 @@ pub struct HeaderChain {
     /// `Parameter::SoftForkStartingHeight`. When voting is inactive, those
     /// keys are absent. This mirrors JVM `parametersTable` exactly.
     active_parameters: Parameters,
-    /// Variable-length encoding of `ErgoValidationSettingsUpdate` (param ID 124,
-    /// `SoftForkDisablingRules`) from the most recent epoch-boundary block's
-    /// extension. Empty when no disabling rules have been voted in.
+    /// Variable-length encoding of `ErgoValidationSettingsUpdate` (extension
+    /// key `[0x00, 124]`, JVM `Parameters.proposedUpdate`) in effect at the
+    /// current chain tip.
+    ///
+    /// Seeded at [`Self::new`] from
+    /// [`crate::voting::default_proposed_update_bytes`] (the JVM
+    /// `LaunchParameters.proposedUpdate` encoding for the configured
+    /// network). Advanced at every validated epoch-boundary block via
+    /// [`Self::apply_epoch_boundary_parameters`], which records that
+    /// block's exact ID 124 bytes — so after the first boundary the
+    /// field tracks on-chain state byte-for-byte.
     ///
     /// JVM stores this on `Parameters.proposedUpdate`, separate from
     /// `parametersTable`. Sigma-rust does not yet expose this on its
-    /// `Parameters` type, so we track the raw bytes here on `HeaderChain`.
-    active_disabling_rules: Vec<u8>,
+    /// `Parameters` type, so we track the raw bytes here on
+    /// `HeaderChain`. The main-session validator reads them via
+    /// [`Self::active_proposed_update_bytes`] and does the byte-for-byte
+    /// comparison against incoming block extensions (JVM
+    /// `Parameters.matchParameters60`), gated on `BlockVersion >=
+    /// Interpreter60Version`.
+    active_proposed_update_bytes: Vec<u8>,
     /// Optional callback for loading extension bytes by height. Required
     /// before calling [`Self::recompute_active_parameters_from_storage`]
     /// or [`crate::nipopow_proof::build_nipopow_proof`].
@@ -136,13 +149,14 @@ impl HeaderChain {
     /// Create a new empty chain with the given network configuration.
     pub fn new(config: ChainConfig) -> Self {
         let active_parameters = default_parameters(config.network);
+        let active_proposed_update_bytes = default_proposed_update_bytes(config.network);
         Self {
             config,
             base_height: None,
             by_id: HashMap::new(),
             scores: Vec::new(),
             active_parameters,
-            active_disabling_rules: Vec::new(),
+            active_proposed_update_bytes,
             extension_loader: None,
             light_client_mode: false,
             lazy: LazyHeaderStore::with_default_capacity(),
@@ -517,40 +531,47 @@ impl HeaderChain {
             }
         }
 
-        // Extract SoftForkDisablingRules (ID 124) raw bytes if present.
-        // JVM stores this on Parameters.proposedUpdate, not parametersTable;
-        // we track it separately on HeaderChain.
-        let disabling_rules = crate::voting::extract_disabling_rules_from_kv(&fields);
+        // Extract proposedUpdate (ID 124) raw bytes from the boundary
+        // extension. JVM stores this on `Parameters.proposedUpdate`, not
+        // `parametersTable`; we track it separately on `HeaderChain`.
+        // Fallback to the launch default if the extension is missing the
+        // field — JVM's equivalent path reads
+        // `ErgoValidationSettingsUpdate.empty` as an absent-field default,
+        // but on mainnet the on-chain value has been non-empty since
+        // before any observed boundary, so an absent ID 124 here would
+        // indicate either a corrupt extension or a test fixture. Either
+        // way, holding the launch default keeps the field well-formed
+        // and the subsequent boundary's `apply_epoch_boundary_parameters`
+        // call overwrites it.
+        let extracted = crate::voting::extract_disabling_rules_from_kv(&fields);
+        let proposed_update = if extracted.is_empty() {
+            default_proposed_update_bytes(self.config.network)
+        } else {
+            extracted
+        };
 
         self.active_parameters = new_params;
-        self.active_disabling_rules = disabling_rules;
+        self.active_proposed_update_bytes = proposed_update;
         Ok(())
     }
 
-    /// Active `SoftForkDisablingRules` (ID 124) bytes from the most recent
-    /// epoch-boundary block's extension. Empty when no disabling rules
-    /// have been voted in.
+    /// Raw `ErgoValidationSettingsUpdate` bytes (extension key
+    /// `[0x00, 124]`, JVM `Parameters.proposedUpdate`) in effect at the
+    /// current chain tip.
     ///
-    /// JVM stores this on `Parameters.proposedUpdate`. Sigma-rust does
-    /// not yet expose it on its `Parameters` type, so we track the raw
-    /// bytes here. The validator (in main repo) parses ID 124 from the
-    /// extension and the caller calls
-    /// [`Self::apply_epoch_boundary_disabling_rules`] after the block is
-    /// validated.
-    pub fn active_disabling_rules(&self) -> &[u8] {
-        &self.active_disabling_rules
-    }
-
-    /// Set the active disabling rules after a successful epoch-boundary block.
+    /// On a fresh chain returns the launch default from
+    /// [`crate::voting::default_proposed_update_bytes`] for the
+    /// configured network. After every accepted epoch-boundary block
+    /// returns that block's exact ID 124 bytes (or the launch default
+    /// as a fallback when a boundary extension has no ID 124 field —
+    /// see [`Self::recompute_active_parameters_from_storage`]).
     ///
-    /// **Precondition**: `bytes` were parsed from the just-validated
-    /// epoch-boundary block's extension (key `[0x00, 0x7C]` = ID 124).
-    /// Caller must have already verified the block via the validator.
-    ///
-    /// Should be called alongside [`Self::apply_epoch_boundary_parameters`]
-    /// at the same lifecycle point. Pass an empty `Vec` to clear.
-    pub fn apply_epoch_boundary_disabling_rules(&mut self, bytes: Vec<u8>) {
-        self.active_disabling_rules = bytes;
+    /// Used by the main-session validator for the byte-for-byte
+    /// `proposedUpdate` comparison in JVM `Parameters.matchParameters60`.
+    /// Sigma-rust does not yet expose `proposedUpdate` on its
+    /// `Parameters` type, so we track the raw bytes here.
+    pub fn active_proposed_update_bytes(&self) -> &[u8] {
+        &self.active_proposed_update_bytes
     }
 
     /// The blockchain parameters in effect at the current chain tip.
@@ -566,23 +587,40 @@ impl HeaderChain {
         &self.active_parameters
     }
 
-    /// Set the active parameters after a successful epoch-boundary block.
+    /// Set the active parameters and proposed-update bytes after a
+    /// successful epoch-boundary block.
     ///
-    /// **Precondition**: `params` was returned by
-    /// [`Self::compute_expected_parameters`] for the just-validated
-    /// epoch-boundary block AND was confirmed to match the params parsed
-    /// from that block's extension.
+    /// **Preconditions**:
+    /// - `params` was returned by [`Self::compute_expected_parameters`]
+    ///   for the just-validated epoch-boundary block AND was confirmed
+    ///   to match the params parsed from that block's extension.
+    /// - `proposed_update_bytes` is the block's exact ID 124 extension
+    ///   value (or `Vec::new()` if the block's extension had no ID 124
+    ///   field — JVM's `ErgoValidationSettingsUpdate.empty` convention).
+    ///   On `BlockVersion >= Interpreter60Version` the main-session
+    ///   validator will already have verified this byte-for-byte against
+    ///   [`Self::active_proposed_update_bytes`] before calling.
     ///
-    /// Called by the validator's caller (the block-application pipeline)
-    /// AFTER the full block has been validated and persisted. Validators
-    /// must NOT call this themselves — they are stateless w.r.t. chain
-    /// state mutation.
+    /// Called by the block-application pipeline AFTER the full block
+    /// has been validated and persisted. Validators must NOT call this
+    /// themselves — they are stateless w.r.t. chain state mutation.
     ///
     /// `params` carries the full table including soft-fork state
     /// (`Parameter::SoftForkVotesCollected`, `Parameter::SoftForkStartingHeight`) when voting
     /// is active. Both are absent when voting is inactive.
-    pub fn apply_epoch_boundary_parameters(&mut self, params: Parameters) {
+    ///
+    /// Both fields are updated atomically: a caller that has verified
+    /// the boundary block must not be able to advance one without the
+    /// other. Callers that only need to advance `active_parameters`
+    /// (e.g. test fixtures with no ID 124 data) can pass the current
+    /// [`Self::active_proposed_update_bytes`] back in unchanged.
+    pub fn apply_epoch_boundary_parameters(
+        &mut self,
+        params: Parameters,
+        proposed_update_bytes: Vec<u8>,
+    ) {
         self.active_parameters = params;
+        self.active_proposed_update_bytes = proposed_update_bytes;
     }
 
     /// Tally the just-ended voting epoch's votes for an epoch boundary.

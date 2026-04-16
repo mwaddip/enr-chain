@@ -347,6 +347,71 @@ pub fn parse_disabled_rules(bytes: &[u8]) -> Result<Vec<u16>, crate::ChainError>
     Ok(rules)
 }
 
+/// Encode a list of disabled rule IDs as an `ErgoValidationSettingsUpdate`
+/// payload with empty `statusUpdates`.
+///
+/// Mirrors JVM `ErgoValidationSettingsUpdateSerializer.serialize`
+/// (`ErgoValidationSettingsUpdate.scala`) for the narrow case of
+/// rules-only updates. Encoding:
+///
+/// ```text
+/// [disabledRulesNum: VLQ u32]
+/// disabledRules × disabledRulesNum: [rule_id: VLQ u16]
+/// [statusUpdatesNum: VLQ u32 = 0]
+/// ```
+///
+/// We do NOT encode status updates here — mainnet / testnet launch
+/// parameters don't carry any, and the chain has no path to introduce
+/// them yet. When a consensus rule change requires status updates the
+/// encoder + storage model will need to be extended.
+///
+/// This is the inverse of [`parse_disabled_rules`] for the
+/// empty-statusUpdates case; round-trip is stable for any `[u16]` list.
+pub fn encode_disabled_rules(rules: &[u16]) -> Vec<u8> {
+    use sigma_ser::vlq_encode::WriteSigmaVlqExt;
+
+    let mut out = Vec::with_capacity(1 + rules.len() * 2 + 1);
+    out.put_u32(rules.len() as u32).expect("Vec write");
+    for &r in rules {
+        out.put_u16(r).expect("Vec write");
+    }
+    out.put_u32(0).expect("Vec write"); // statusUpdatesNum = 0
+    out
+}
+
+/// Default encoded `ErgoValidationSettingsUpdate` (ID 124) bytes for a
+/// fresh chain on the given network.
+///
+/// Mirrors JVM `LaunchParameters.proposedUpdate` —
+/// `ErgoValidationSettingsUpdate(rulesToDisable = Seq(215, 409),
+/// statusUpdates = Seq.empty)` — for both mainnet and testnet.
+///
+/// Used to seed [`crate::HeaderChain::active_proposed_update_bytes`] at
+/// [`crate::HeaderChain::new`] so the field carries a meaningful value
+/// before any epoch-boundary block has been applied.
+///
+/// **Consensus note**: this seed is only consulted before the first
+/// epoch-boundary block is applied. From the first boundary onward,
+/// [`crate::HeaderChain::apply_epoch_boundary_parameters`] advances the
+/// field to the exact ID 124 bytes of each accepted boundary block, so
+/// the chain tracks on-chain state byte-for-byte. The main-session
+/// validator's byte-for-byte comparison (JVM
+/// `Parameters.matchParameters60`) short-circuits for `BlockVersion <
+/// Interpreter60Version`, so the first comparison only runs at v4+ —
+/// mainnet h=1,628,160 — by which point every boundary has been
+/// processed and the seed is no longer in effect.
+///
+/// Forward-compat: when a vote legitimately introduces
+/// `statusUpdates`, this helper (and [`encode_disabled_rules`]) must
+/// be extended to emit them. Tracked as future work.
+pub fn default_proposed_update_bytes(network: crate::Network) -> Vec<u8> {
+    // Mainnet and testnet both use `LaunchParameters.proposedUpdate =
+    // ErgoValidationSettingsUpdate(Seq(215, 409), Seq.empty)` — see JVM
+    // `LaunchParameters.scala` and the testnet launch equivalent.
+    let _ = network;
+    encode_disabled_rules(&[215, 409])
+}
+
 /// Pack a parameter table into extension key-value pairs.
 ///
 /// Inverse of [`parse_parameters_from_kv`]. Mirrors JVM
@@ -913,5 +978,64 @@ mod tests {
         // Claims 2 rules, supplies bytes for 1. Must not panic.
         let bytes = [0x02u8, 0xD7, 0x01];
         assert!(parse_disabled_rules(&bytes).is_err());
+    }
+
+    /// Round-trip: encode the mainnet launch default
+    /// (`ErgoValidationSettingsUpdate(Seq(215, 409), Seq.empty)`) and
+    /// parse it back. Any future encoder change must preserve this.
+    #[test]
+    fn encode_decode_mainnet_launch_round_trip() {
+        let bytes = encode_disabled_rules(&[215, 409]);
+        let rules = parse_disabled_rules(&bytes).unwrap();
+        assert_eq!(rules, vec![215u16, 409u16]);
+    }
+
+    /// The encoder produces exactly the launch-default byte sequence:
+    /// `[disabledRulesNum=2][215][409][statusUpdatesNum=0]` in VLQ, i.e.
+    /// `02 D7 01 99 03 00`. This is the prefix of the mainnet block
+    /// 1,628,160 ID 124 value — the trailing `03 0B 01 03 10 07 01 03 11
+    /// 08 01 03 12` encodes 3 status updates we deliberately don't model.
+    #[test]
+    fn encode_disabled_rules_empty_status_updates_layout() {
+        let bytes = encode_disabled_rules(&[215, 409]);
+        assert_eq!(
+            bytes,
+            vec![0x02, 0xD7, 0x01, 0x99, 0x03, 0x00],
+            "encoder emits rulesToDisable=[215,409] + empty statusUpdates"
+        );
+    }
+
+    #[test]
+    fn encode_disabled_rules_empty_input() {
+        // Empty rules list + empty statusUpdates = two VLQ-zero bytes.
+        let bytes = encode_disabled_rules(&[]);
+        assert_eq!(bytes, vec![0x00, 0x00]);
+    }
+
+    /// Mainnet seed matches the rulesToDisable prefix of the on-chain
+    /// ID 124 value at every observed boundary (h=1,562,624 / 1,627,136
+    /// / 1,628,160). The 6th byte diverges (we emit `0x00` for empty
+    /// statusUpdates; on-chain has `0x03` for 3 status updates that
+    /// predate our first observation). This is acceptable because the
+    /// main-session validator gates the byte-for-byte comparison on
+    /// BlockVersion >= 4 (JVM `matchParameters60`), and by the time v4
+    /// activates at h=1,628,160 the seed has been superseded by every
+    /// prior boundary's `apply_epoch_boundary_parameters` call.
+    #[test]
+    fn default_proposed_update_bytes_mainnet_matches_rules_prefix() {
+        let bytes = default_proposed_update_bytes(crate::Network::Mainnet);
+        assert!(
+            bytes.starts_with(&[0x02, 0xD7, 0x01, 0x99, 0x03]),
+            "mainnet seed must encode rulesToDisable=[215,409]; got {bytes:?}"
+        );
+    }
+
+    #[test]
+    fn default_proposed_update_bytes_testnet_matches_rules_prefix() {
+        let bytes = default_proposed_update_bytes(crate::Network::Testnet);
+        assert!(
+            bytes.starts_with(&[0x02, 0xD7, 0x01, 0x99, 0x03]),
+            "testnet seed must encode rulesToDisable=[215,409]; got {bytes:?}"
+        );
     }
 }

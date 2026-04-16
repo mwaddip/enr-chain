@@ -1630,7 +1630,8 @@ mod voting_chain_tests {
             100,       // DataInputCost
             100,       // OutputCost
         );
-        chain.apply_epoch_boundary_parameters(new_params.clone());
+        let keep = chain.active_proposed_update_bytes().to_vec();
+        chain.apply_epoch_boundary_parameters(new_params.clone(), keep);
         assert_eq!(chain.active_parameters(), &new_params);
         assert_eq!(chain.active_parameters().storage_fee_factor(), 1_300_000);
         assert_eq!(chain.active_parameters().block_version(), 2);
@@ -1989,7 +1990,8 @@ mod voting_chain_tests {
 
             // For this test we simulate ONLY by calling compute → apply; the chain
             // remains at voting_end the whole time.
-            chain.apply_epoch_boundary_parameters(params);
+            let keep = chain.active_proposed_update_bytes().to_vec();
+            chain.apply_epoch_boundary_parameters(params, keep);
             current_height += voting_length;
         }
         // After voting period, BlockVersion has NOT changed yet (activation is later).
@@ -2008,25 +2010,37 @@ mod voting_chain_tests {
     }
 
     #[test]
-    fn active_disabling_rules_starts_empty() {
+    fn active_proposed_update_bytes_starts_at_launch_default() {
+        // Fresh chain seeds the field from
+        // `default_proposed_update_bytes(network)` — the encoded form
+        // of JVM `LaunchParameters.proposedUpdate` =
+        // `ErgoValidationSettingsUpdate(Seq(215, 409), Seq.empty)`.
         let chain = HeaderChain::new(testnet_config());
-        assert!(chain.active_disabling_rules().is_empty());
+        let default = crate::voting::default_proposed_update_bytes(crate::Network::Testnet);
+        assert_eq!(chain.active_proposed_update_bytes(), &default[..]);
+        assert!(
+            chain.active_proposed_update_bytes().starts_with(&[
+                0x02, 0xD7, 0x01, 0x99, 0x03
+            ]),
+            "seed must encode rulesToDisable=[215,409]"
+        );
     }
 
     #[test]
-    fn apply_epoch_boundary_disabling_rules_round_trip() {
+    fn apply_epoch_boundary_parameters_updates_proposed_update_bytes() {
         let mut chain = HeaderChain::new(testnet_config());
+        let params = chain.active_parameters().clone();
         let bytes = vec![0x02, 0xD7, 0x01, 0x99, 0x03, 0x00];
-        chain.apply_epoch_boundary_disabling_rules(bytes.clone());
-        assert_eq!(chain.active_disabling_rules(), &bytes[..]);
+        chain.apply_epoch_boundary_parameters(params.clone(), bytes.clone());
+        assert_eq!(chain.active_proposed_update_bytes(), &bytes[..]);
 
-        // Clearing
-        chain.apply_epoch_boundary_disabling_rules(Vec::new());
-        assert!(chain.active_disabling_rules().is_empty());
+        // Subsequent call replaces the previous value — no ratchet.
+        chain.apply_epoch_boundary_parameters(params, Vec::new());
+        assert!(chain.active_proposed_update_bytes().is_empty());
     }
 
     #[test]
-    fn recompute_extracts_disabling_rules_from_extension() {
+    fn recompute_extracts_proposed_update_from_extension() {
         use crate::voting::{pack_extension_bytes, pack_parameters_to_kv};
         use std::collections::HashMap;
 
@@ -2076,12 +2090,68 @@ mod voting_chain_tests {
         let tip = chain.height();
         chain.recompute_active_parameters_from_storage(tip).unwrap();
         assert_eq!(
-            chain.active_disabling_rules(),
+            chain.active_proposed_update_bytes(),
             &disabling_rules_bytes[..],
-            "ID 124 bytes should round-trip from extension into active_disabling_rules"
+            "ID 124 bytes should round-trip from extension into active_proposed_update_bytes"
         );
         // Block version is also restored
         assert_eq!(chain.active_parameters().block_version(), 4);
+    }
+
+    #[test]
+    fn recompute_absent_id_124_falls_back_to_launch_default() {
+        // A boundary extension that carries parameters but no ID 124
+        // field must leave `active_proposed_update_bytes` at the
+        // network launch default rather than silently clearing it —
+        // empty bytes here would diverge from JVM, which treats the
+        // absent field as `ErgoValidationSettingsUpdate.empty` but
+        // this Rust chain has never observed a mainnet boundary
+        // without the field since it was introduced pre-v6.
+        use crate::voting::{pack_extension_bytes, pack_parameters_to_kv};
+        use std::collections::HashMap;
+
+        let mut chain = HeaderChain::new(testnet_config());
+        let n_bits = chain.config().initial_n_bits;
+
+        // Build a chain past the first epoch boundary (height 128).
+        let mut prev = ergo_chain_types::BlockId(ergo_chain_types::Digest32::zero());
+        let g = make_header_with_votes(1, prev, 1_000_000, n_bits, [0, 0, 0]);
+        prev = g.id;
+        chain.try_append_no_pow(g).unwrap();
+        for h in 2..=130 {
+            let header = make_header_with_votes(
+                h, prev, 1_000_000 + (h as u64 - 1) * 45_000, n_bits, [0, 0, 0],
+            );
+            prev = header.id;
+            chain.try_append_no_pow(header).unwrap();
+        }
+
+        // Extension carries parameters but NO ID 124 entry.
+        let mut params: HashMap<i8, i32> = HashMap::new();
+        params.insert(1, 1_250_000);
+        params.insert(123, 4);
+        let kv = pack_parameters_to_kv(&params);
+
+        let header_id = chain.header_at(128).unwrap().id;
+        let extension_bytes = pack_extension_bytes(&header_id, &kv);
+
+        chain.set_extension_loader(move |h| {
+            if h == 128 {
+                Some(extension_bytes.clone())
+            } else {
+                None
+            }
+        });
+
+        let tip = chain.height();
+        chain.recompute_active_parameters_from_storage(tip).unwrap();
+
+        let expected = crate::voting::default_proposed_update_bytes(crate::Network::Testnet);
+        assert_eq!(
+            chain.active_proposed_update_bytes(),
+            &expected[..],
+            "absent ID 124 in boundary extension must fall back to launch default"
+        );
     }
 
     #[test]
@@ -2143,7 +2213,8 @@ mod voting_chain_tests {
                 .contains_key(&Parameter::SubblocksPerBlock),
             "precondition: stripped table must not contain SubblocksPerBlock"
         );
-        chain.apply_epoch_boundary_parameters(stripped);
+        let keep = chain.active_proposed_update_bytes().to_vec();
+        chain.apply_epoch_boundary_parameters(stripped, keep);
 
         let expected = chain.compute_expected_parameters(128, &[]).unwrap();
         assert_eq!(expected.block_version(), 4);
@@ -2427,7 +2498,8 @@ mod voting_chain_tests {
             .insert(Parameter::SoftForkStartingHeight, starting_height as i32);
         pre.parameters_table
             .insert(Parameter::SoftForkVotesCollected, votes_collected);
-        chain.apply_epoch_boundary_parameters(pre);
+        let keep = chain.active_proposed_update_bytes().to_vec();
+        chain.apply_epoch_boundary_parameters(pre, keep);
 
         let result = chain
             .compute_expected_parameters(activation, &MAINNET_V6_PROPOSED_UPDATE)
@@ -2495,7 +2567,8 @@ mod voting_chain_tests {
             .insert(Parameter::SoftForkStartingHeight, starting_height as i32);
         pre.parameters_table
             .insert(Parameter::SoftForkVotesCollected, votes_collected);
-        chain.apply_epoch_boundary_parameters(pre);
+        let keep = chain.active_proposed_update_bytes().to_vec();
+        chain.apply_epoch_boundary_parameters(pre, keep);
 
         // Same bytes as at activation — doesn't matter because the gate
         // sees no voting-driven BlockVersion bump in this call and
@@ -2549,7 +2622,8 @@ mod voting_chain_tests {
             .insert(Parameter::SoftForkStartingHeight, starting_height as i32);
         pre.parameters_table
             .insert(Parameter::SoftForkVotesCollected, 31_532);
-        chain.apply_epoch_boundary_parameters(pre);
+        let keep = chain.active_proposed_update_bytes().to_vec();
+        chain.apply_epoch_boundary_parameters(pre, keep);
 
         // Empty proposed update → rule 409 NOT in activatedUpdate → insert fires.
         let result = chain
