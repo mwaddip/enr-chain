@@ -632,12 +632,20 @@ impl HeaderChain {
     /// IDs 1-8, BlockVersion (123), and soft-fork lifecycle state
     /// (`Parameter::SoftForkVotesCollected` / `Parameter::SoftForkStartingHeight`) when active.
     ///
+    /// `block_proposed_update` is the raw payload of the block's extension
+    /// key `[0x00, 124]` (`SoftForkDisablingRules` /
+    /// `ErgoValidationSettingsUpdate`), or the empty slice if absent. It is
+    /// consulted ONLY to gate the `SubblocksPerBlock` auto-insert at the
+    /// voting-driven v4 activation — see Step 4 below and
+    /// `facts/chain.md` Phase 6.
+    ///
     /// **Determinism**: For any two correct implementations given the same
     /// chain history, the output is byte-identical. This is the consensus
     /// rule. Mismatch with the actual block extension = reject the block.
     pub fn compute_expected_parameters(
         &self,
         epoch_boundary_height: u32,
+        block_proposed_update: &[u8],
     ) -> Result<Parameters, ChainError> {
         let voting = &self.config.voting;
         if voting.voting_length == 0 {
@@ -647,6 +655,16 @@ impl HeaderChain {
         let tally = self.tally_just_ended_epoch(epoch_boundary_height)?;
 
         let mut new_params = self.active_parameters.clone();
+
+        // Snapshot the pre-update BlockVersion so we can detect a voting-
+        // driven activation (Step 2) in Step 4. Taken before any step runs —
+        // Step 1 can't touch BlockVersion but this keeps the source of the
+        // snapshot obviously independent of the subsequent mutations.
+        let pre_update_block_version = new_params
+            .parameters_table
+            .get(&Parameter::BlockVersion)
+            .copied()
+            .unwrap_or(0);
 
         // Step 1: ordinary parameter changes (IDs ±1..±8).
         for (&signed_id, &count) in &tally {
@@ -687,28 +705,45 @@ impl HeaderChain {
             }
         }
 
-        // Step 4: auto-insert SubblocksPerBlock at BlockVersion == 4.
+        // Step 4: auto-insert SubblocksPerBlock at BlockVersion == 4,
+        // gated on rule 409 in the activated update (JVM parity).
         //
-        // Mirrors JVM `Parameters.scala::update` (~line 93): when the
+        // Mirrors JVM `Parameters.scala::update` (lines 87-96): when the
         // protocol reaches v4 (the 6.0 soft-fork that introduces sub-blocks)
         // and `SubblocksPerBlock` is not yet present in the table, insert it
-        // with the default value (30).
+        // with the default value (30) — UNLESS the update being activated
+        // in this call disables rule 409 (`exMatchParameters`). JVM's
+        // mainnet hard-codes `proposedUpdate = [215, 409]` at launch
+        // (`LaunchParameters.scala`), so when that proposal is activated at
+        // the v6 BlockVersion bump (h=1,628,160 on mainnet), rule 409 is
+        // present in `activatedUpdate` and the insert is skipped; it fires
+        // at the NEXT boundary instead.
         //
-        // TODO: JVM additionally guards this with `!disablingRules.contains(409)`,
-        // where rule 409 enforces that all parameters in the extension match
-        // a known schema. We do NOT track per-rule disabling state; we only
-        // store the raw `active_disabling_rules` bytes (ID 124) for the
-        // byte-for-byte epoch-boundary comparison. As long as rule 409 is
-        // never voted-disabled on testnet/mainnet, this is consensus-correct.
-        // If rule 409 is ever voted disabled, this auto-insert becomes wrong.
-        if new_params
+        // `activatedUpdate` in JVM is `proposedUpdate` at activation height,
+        // `empty` otherwise. We reproduce this by checking whether the
+        // voting lifecycle bumped BlockVersion in this call. The forced-v2
+        // activation (1 → 2 at `version2_activation_height`) is explicitly
+        // excluded — JVM does NOT wire `activatedUpdate` for that path.
+        let post_update_block_version = new_params
             .parameters_table
             .get(&Parameter::BlockVersion)
             .copied()
-            == Some(4)
+            .unwrap_or(0);
+        let is_voting_activation = post_update_block_version != pre_update_block_version
+            && !(voting.version2_activation_height != 0
+                && epoch_boundary_height == voting.version2_activation_height
+                && post_update_block_version == 2);
+        let rule_409_in_activated = if is_voting_activation {
+            crate::voting::parse_disabled_rules(block_proposed_update)?.contains(&409u16)
+        } else {
+            false
+        };
+
+        if post_update_block_version == 4
             && !new_params
                 .parameters_table
                 .contains_key(&Parameter::SubblocksPerBlock)
+            && !rule_409_in_activated
         {
             new_params.parameters_table.insert(
                 Parameter::SubblocksPerBlock,

@@ -1668,7 +1668,7 @@ mod voting_chain_tests {
         let original = chain.active_parameters().storage_fee_factor();
         assert_eq!(original, 1_250_000);
 
-        let expected = chain.compute_expected_parameters(128).unwrap();
+        let expected = chain.compute_expected_parameters(128, &[]).unwrap();
         // Step is +25_000 for ID 1
         assert_eq!(expected.storage_fee_factor(), 1_275_000);
     }
@@ -1699,7 +1699,7 @@ mod voting_chain_tests {
             chain.try_append_no_pow(header).unwrap();
         }
 
-        let expected = chain.compute_expected_parameters(128).unwrap();
+        let expected = chain.compute_expected_parameters(128, &[]).unwrap();
         // Tally is exactly 64 → not approved → unchanged.
         assert_eq!(expected.storage_fee_factor(), 1_250_000);
     }
@@ -1730,7 +1730,7 @@ mod voting_chain_tests {
             chain.try_append_no_pow(header).unwrap();
         }
 
-        let expected = chain.compute_expected_parameters(128).unwrap();
+        let expected = chain.compute_expected_parameters(128, &[]).unwrap();
         assert_eq!(expected.storage_fee_factor(), 1_225_000); // -25_000
     }
 
@@ -1757,7 +1757,7 @@ mod voting_chain_tests {
             chain.try_append_no_pow(header).unwrap();
         }
 
-        let expected = chain.compute_expected_parameters(128).unwrap();
+        let expected = chain.compute_expected_parameters(128, &[]).unwrap();
         assert_eq!(
             expected.storage_fee_factor(),
             chain.active_parameters().storage_fee_factor()
@@ -1981,7 +1981,7 @@ mod voting_chain_tests {
         // At each, simulate validator: compute, then apply.
         let mut current_height = voting_length;
         while current_height <= voting_end {
-            let params = chain.compute_expected_parameters(current_height).unwrap();
+            let params = chain.compute_expected_parameters(current_height, &[]).unwrap();
             // Save current tip; we need to advance to the boundary height before applying.
             // (We've already built the chain — now we just simulate apply at each boundary.)
             // The chain's tip is at voting_end, so we need a per-height apply path.
@@ -2100,7 +2100,7 @@ mod voting_chain_tests {
         use ergo_lib::chain::parameters::Parameter;
 
         let chain = build_chain_with_votes(128, [0, 0, 0]);
-        let expected = chain.compute_expected_parameters(128).unwrap();
+        let expected = chain.compute_expected_parameters(128, &[]).unwrap();
 
         assert_eq!(expected.storage_fee_factor(), 1_250_000);
         assert_eq!(expected.min_value_per_byte(), 360);
@@ -2145,7 +2145,7 @@ mod voting_chain_tests {
         );
         chain.apply_epoch_boundary_parameters(stripped);
 
-        let expected = chain.compute_expected_parameters(128).unwrap();
+        let expected = chain.compute_expected_parameters(128, &[]).unwrap();
         assert_eq!(expected.block_version(), 4);
         assert_eq!(
             expected
@@ -2330,6 +2330,241 @@ mod voting_chain_tests {
             .expect("target above second boundary must load 256");
 
         assert_eq!(chain.active_parameters().storage_fee_factor(), 1_400_000);
+    }
+
+    // ---- Mainnet v6 activation regression tests ----
+    //
+    // Mainnet sync stalled at height 1,628,160 because our
+    // `compute_expected_parameters` unconditionally auto-inserted
+    // `SubblocksPerBlock` at BlockVersion==4, emitting 12 parameter-table
+    // entries while the on-chain block carried 11. JVM guards the insert
+    // with `!activatedUpdate.rulesToDisable.contains(409)`; mainnet's
+    // `LaunchParameters.proposedUpdate = [215, 409]` is activated at the
+    // v6 BlockVersion bump (1,562,624 + 1024 * 64 = 1,628,160), so the
+    // insert is suppressed at activation and fires at the next boundary.
+
+    /// Build a mainnet `HeaderChain` populated across the just-ended
+    /// voting epoch for `boundary_height`. All headers carry zero votes —
+    /// tests that need specific pre-state seed `active_parameters`
+    /// manually via `apply_epoch_boundary_parameters`.
+    ///
+    /// Uses `install_from_nipopow_proof_no_pow` to avoid synthesizing
+    /// the 1.6M-header genesis prefix. `light_client_mode` is set as a
+    /// side-effect; irrelevant here because
+    /// `compute_expected_parameters` does not gate on it.
+    fn build_mainnet_chain_for_boundary(boundary_height: u32) -> HeaderChain {
+        let config = crate::ChainConfig::mainnet();
+        let voting_length = config.voting.voting_length;
+        assert!(
+            boundary_height >= voting_length,
+            "boundary height must be ≥ voting_length (1024) for the epoch walk to be non-empty"
+        );
+        let n_bits = config.initial_n_bits;
+
+        let base_height = boundary_height - voting_length;
+        let mut prev_id = BlockId(Digest32::zero());
+        let head = make_header_with_votes(
+            base_height,
+            prev_id,
+            1_000_000,
+            n_bits,
+            [0, 0, 0],
+        );
+        prev_id = head.id;
+
+        let mut tail: Vec<Header> = Vec::with_capacity((voting_length - 1) as usize);
+        for i in 1..voting_length {
+            let hdr = make_header_with_votes(
+                base_height + i,
+                prev_id,
+                1_000_000 + (i as u64) * 45_000,
+                n_bits,
+                [0, 0, 0],
+            );
+            prev_id = hdr.id;
+            tail.push(hdr);
+        }
+
+        let mut chain = HeaderChain::new(config);
+        chain
+            .install_from_nipopow_proof_no_pow(head, tail)
+            .expect("install must succeed on fresh chain");
+        assert_eq!(chain.height(), boundary_height - 1);
+        chain
+    }
+
+    /// Raw `ErgoValidationSettingsUpdate` payload observed on mainnet
+    /// block 1,628,160 extension (key `[0x00, 0x7C]`). Decodes to
+    /// `rulesToDisable = [215, 409]` + 3 status updates.
+    const MAINNET_V6_PROPOSED_UPDATE: [u8; 18] = [
+        0x02, 0xD7, 0x01, 0x99, 0x03, 0x03, 0x0B, 0x01, 0x03,
+        0x10, 0x07, 0x01, 0x03, 0x11, 0x08, 0x01, 0x03, 0x12,
+    ];
+
+    #[test]
+    fn compute_expected_parameters_mainnet_v6_activation_suppresses_subblocks() {
+        // Activation boundary: `activatedUpdate` contains rule 409 → Step 4
+        // auto-insert of `SubblocksPerBlock` MUST be skipped. Result = 11
+        // entries (8 ordinary + BlockVersion + 121 + 122).
+        use ergo_lib::chain::parameters::Parameter;
+
+        let starting_height = 1_562_624u32;
+        let voting_length = 1024u32;
+        let activation = starting_height + voting_length * 64; // 1,628,160
+        assert_eq!(activation, 1_628_160);
+
+        // On-chain ground truth at h=1,627,136 (previous boundary):
+        // SoftForkVotesCollected = 0x7b2c = 31,532. Well above the
+        // approval threshold (1024 * 32 * 9 / 10 = 29,491).
+        let votes_collected = 31_532i32;
+
+        let mut chain = build_mainnet_chain_for_boundary(activation);
+
+        let mut pre = crate::voting::default_parameters(crate::Network::Mainnet);
+        pre.parameters_table
+            .insert(Parameter::BlockVersion, 3);
+        pre.parameters_table
+            .insert(Parameter::SoftForkStartingHeight, starting_height as i32);
+        pre.parameters_table
+            .insert(Parameter::SoftForkVotesCollected, votes_collected);
+        chain.apply_epoch_boundary_parameters(pre);
+
+        let result = chain
+            .compute_expected_parameters(activation, &MAINNET_V6_PROPOSED_UPDATE)
+            .expect("compute must succeed");
+
+        assert_eq!(
+            result.block_version(),
+            4,
+            "voting activation must bump BlockVersion 3 → 4"
+        );
+        assert!(
+            !result
+                .parameters_table
+                .contains_key(&Parameter::SubblocksPerBlock),
+            "rule 409 in activatedUpdate MUST suppress SubblocksPerBlock auto-insert"
+        );
+        assert_eq!(
+            result
+                .parameters_table
+                .get(&Parameter::SoftForkStartingHeight)
+                .copied(),
+            Some(starting_height as i32),
+            "soft-fork state persists until cleanup_success (next boundary)",
+        );
+        assert_eq!(
+            result
+                .parameters_table
+                .get(&Parameter::SoftForkVotesCollected)
+                .copied(),
+            Some(votes_collected),
+        );
+        // 8 ordinary (IDs 1-8) + BlockVersion (123) + 121 + 122 = 11
+        assert_eq!(
+            result.parameters_table.len(),
+            11,
+            "table must match on-chain block's 11-entry layout"
+        );
+    }
+
+    #[test]
+    fn compute_expected_parameters_mainnet_v6_cleanup_success_inserts_subblocks() {
+        // Next boundary after activation (cleanup_success): JVM's
+        // `activatedUpdate` is empty this call (no activation happens),
+        // so rule 409 gate is false → SubblocksPerBlock IS auto-inserted.
+        // Result = 10 entries (8 ordinary + BlockVersion + SubblocksPerBlock,
+        // with 121/122 removed by cleanup).
+        use ergo_lib::chain::parameters::Parameter;
+
+        let starting_height = 1_562_624u32;
+        let voting_length = 1024u32;
+        let cleanup_success = starting_height + voting_length * 65; // 1,629,184
+        assert_eq!(cleanup_success, 1_629_184);
+
+        let votes_collected = 31_532i32;
+
+        let mut chain = build_mainnet_chain_for_boundary(cleanup_success);
+
+        // Pre-state after the 1,628,160 activation was applied:
+        // BlockVersion = 4, soft-fork state still present (it clears at
+        // THIS boundary), NO SubblocksPerBlock yet.
+        let mut pre = crate::voting::default_parameters(crate::Network::Mainnet);
+        pre.parameters_table
+            .insert(Parameter::BlockVersion, 4);
+        pre.parameters_table
+            .insert(Parameter::SoftForkStartingHeight, starting_height as i32);
+        pre.parameters_table
+            .insert(Parameter::SoftForkVotesCollected, votes_collected);
+        chain.apply_epoch_boundary_parameters(pre);
+
+        // Same bytes as at activation — doesn't matter because the gate
+        // sees no voting-driven BlockVersion bump in this call and
+        // skips the parse.
+        let result = chain
+            .compute_expected_parameters(cleanup_success, &MAINNET_V6_PROPOSED_UPDATE)
+            .expect("compute must succeed");
+
+        assert_eq!(result.block_version(), 4);
+        assert!(
+            !result
+                .parameters_table
+                .contains_key(&Parameter::SoftForkStartingHeight),
+            "cleanup_success must remove SoftForkStartingHeight"
+        );
+        assert!(
+            !result
+                .parameters_table
+                .contains_key(&Parameter::SoftForkVotesCollected),
+            "cleanup_success must remove SoftForkVotesCollected"
+        );
+        assert_eq!(
+            result
+                .parameters_table
+                .get(&Parameter::SubblocksPerBlock)
+                .copied(),
+            Some(30),
+            "SubblocksPerBlock auto-insert fires at the boundary AFTER activation"
+        );
+        // 8 ordinary + BlockVersion + SubblocksPerBlock = 10
+        assert_eq!(result.parameters_table.len(), 10);
+    }
+
+    #[test]
+    fn compute_expected_parameters_mainnet_v6_activation_with_empty_update_inserts_subblocks() {
+        // Counterfactual: if the activation block's ID 124 field were
+        // empty (or absent), the gate would NOT trip and the insert
+        // would fire. Confirms the guard is genuinely driven by the
+        // payload, not by the activation itself.
+        use ergo_lib::chain::parameters::Parameter;
+
+        let starting_height = 1_562_624u32;
+        let voting_length = 1024u32;
+        let activation = starting_height + voting_length * 64;
+
+        let mut chain = build_mainnet_chain_for_boundary(activation);
+
+        let mut pre = crate::voting::default_parameters(crate::Network::Mainnet);
+        pre.parameters_table.insert(Parameter::BlockVersion, 3);
+        pre.parameters_table
+            .insert(Parameter::SoftForkStartingHeight, starting_height as i32);
+        pre.parameters_table
+            .insert(Parameter::SoftForkVotesCollected, 31_532);
+        chain.apply_epoch_boundary_parameters(pre);
+
+        // Empty proposed update → rule 409 NOT in activatedUpdate → insert fires.
+        let result = chain
+            .compute_expected_parameters(activation, &[])
+            .expect("compute must succeed");
+
+        assert_eq!(result.block_version(), 4);
+        assert_eq!(
+            result
+                .parameters_table
+                .get(&Parameter::SubblocksPerBlock)
+                .copied(),
+            Some(30),
+            "without rule 409 in activatedUpdate, auto-insert fires at activation"
+        );
     }
 }
 

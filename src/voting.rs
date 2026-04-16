@@ -304,6 +304,49 @@ pub fn extract_disabling_rules_from_kv(kv: &[([u8; 2], Vec<u8>)]) -> Vec<u8> {
     Vec::new()
 }
 
+/// Parse just the `rulesToDisable` list from a raw
+/// `ErgoValidationSettingsUpdate` payload (extension key `[0x00, 124]`).
+///
+/// Mirrors JVM `ErgoValidationSettingsUpdateSerializer.parse`
+/// (`ErgoValidationSettingsUpdate.scala`) but stops after the
+/// `disabledRulesNum` + rule IDs section — we don't need `statusUpdates`
+/// for the consensus checks that use this. Encoding:
+///
+/// ```text
+/// [disabledRulesNum: VLQ u32]
+/// disabledRules × disabledRulesNum: [rule_id: VLQ u16]
+/// (remainder: statusUpdates — ignored here)
+/// ```
+///
+/// Empty input → empty `Vec` (mirrors JVM's
+/// `ErgoValidationSettingsUpdate.empty`, the default when extension key
+/// `[0x00, 124]` is absent from the block).
+pub fn parse_disabled_rules(bytes: &[u8]) -> Result<Vec<u16>, crate::ChainError> {
+    use crate::ChainError;
+    use sigma_ser::vlq_encode::ReadSigmaVlqExt;
+
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut cursor = std::io::Cursor::new(bytes);
+    let count = cursor
+        .get_u32()
+        .map_err(|e| ChainError::ExtensionParse(format!("disabled rules count: {e}")))?
+        as usize;
+    // Cap capacity so a bogus `count` on a small payload can't force a large
+    // pre-allocation. The subsequent `get_u16` calls will bail naturally if
+    // the byte stream is truncated.
+    let cap = count.min(bytes.len());
+    let mut rules = Vec::with_capacity(cap);
+    for i in 0..count {
+        let rule = cursor.get_u16().map_err(|e| {
+            ChainError::ExtensionParse(format!("disabled rule id at index {i}: {e}"))
+        })?;
+        rules.push(rule);
+    }
+    Ok(rules)
+}
+
 /// Pack a parameter table into extension key-value pairs.
 ///
 /// Inverse of [`parse_parameters_from_kv`]. Mirrors JVM
@@ -828,5 +871,47 @@ mod tests {
         // Empty extension is exactly: 32 header bytes + 1 VLQ count byte (0)
         assert_eq!(bytes.len(), 33);
         assert_eq!(bytes[32], 0x00);
+    }
+
+    /// Regression: mainnet block 1,628,160 extension carries this exact
+    /// `SoftForkDisablingRules` payload (key `[0x00, 0x7C]`). JVM's
+    /// `ErgoValidationSettingsUpdateSerializer` parses it as
+    /// `rulesToDisable = [215, 409]` + 3 status updates. Rule 409 in this
+    /// list is what suppresses the `SubblocksPerBlock` auto-insert at the
+    /// v6 BlockVersion activation — without this gate our node emits 12
+    /// parameter-table entries vs JVM's 11 and diverges.
+    #[test]
+    fn parse_disabled_rules_mainnet_v6_activation() {
+        // 02 d7 01 99 03 03 0b 01 03 10 07 01 03 11 08 01 03 12
+        // ^^ ^^^^^^^^^^^^^^ ^^ -- remainder is statusUpdates (ignored)
+        // |  |           |
+        // |  215 (VLQ)   409 (VLQ)
+        // disabledRulesNum = 2 (VLQ)
+        let bytes: [u8; 18] = [
+            0x02, 0xD7, 0x01, 0x99, 0x03, 0x03, 0x0B, 0x01, 0x03,
+            0x10, 0x07, 0x01, 0x03, 0x11, 0x08, 0x01, 0x03, 0x12,
+        ];
+        let rules = parse_disabled_rules(&bytes).unwrap();
+        assert_eq!(rules, vec![215u16, 409u16]);
+    }
+
+    #[test]
+    fn parse_disabled_rules_empty_input_ok() {
+        // Absent ID 124 field maps to empty input by convention — JVM
+        // treats it as `ErgoValidationSettingsUpdate.empty`.
+        assert_eq!(parse_disabled_rules(&[]).unwrap(), Vec::<u16>::new());
+    }
+
+    #[test]
+    fn parse_disabled_rules_count_only_ok() {
+        // `disabledRulesNum = 0` with no rules following — valid.
+        assert_eq!(parse_disabled_rules(&[0x00]).unwrap(), Vec::<u16>::new());
+    }
+
+    #[test]
+    fn parse_disabled_rules_truncated_errors() {
+        // Claims 2 rules, supplies bytes for 1. Must not panic.
+        let bytes = [0x02u8, 0xD7, 0x01];
+        assert!(parse_disabled_rules(&bytes).is_err());
     }
 }
