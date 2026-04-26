@@ -343,7 +343,7 @@ impl HeaderChain {
     /// Mirrors JVM `(height % votingEpochLength == 0) && height > 0`.
     /// Pure computation; safe to call on an empty chain.
     pub fn is_epoch_boundary(&self, height: u32) -> bool {
-        height > 0 && height % self.config.voting.voting_length == 0
+        height > 0 && height.is_multiple_of(self.config.voting.voting_length)
     }
 
     /// Register a callback for loading raw extension bytes by height.
@@ -635,9 +635,7 @@ impl HeaderChain {
         epoch_boundary_height: u32,
     ) -> Result<HashMap<i8, u32>, ChainError> {
         let voting_length = self.config.voting.voting_length;
-        let nominal_start = epoch_boundary_height
-            .checked_sub(voting_length)
-            .unwrap_or(0);
+        let nominal_start = epoch_boundary_height.saturating_sub(voting_length);
         let start = nominal_start.max(1);
         let end = epoch_boundary_height
             .checked_sub(1)

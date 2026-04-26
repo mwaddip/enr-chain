@@ -3,11 +3,23 @@ use ergo_chain_types::Header;
 
 use crate::state_type::StateType;
 
-/// Modifier type IDs for block sections.
+/// Modifier type IDs (Ergo `NetworkObjectTypeId`).
+///
+/// `HEADER_TYPE_ID` and the three section IDs identify the components of a
+/// full block. `TRANSACTION_TYPE_ID` identifies an *unconfirmed* transaction
+/// modifier (mempool / inv-relay), not a block section — it's not returned
+/// by [`section_ids`] or [`required_section_ids`].
 pub const HEADER_TYPE_ID: u8 = 101;
 pub const BLOCK_TRANSACTIONS_TYPE_ID: u8 = 102;
 pub const AD_PROOFS_TYPE_ID: u8 = 104;
 pub const EXTENSION_TYPE_ID: u8 = 108;
+
+/// Modifier type ID for unconfirmed transactions (mempool / inv-relay).
+///
+/// Distinct from `BLOCK_TRANSACTIONS_TYPE_ID` (102), which is the block
+/// section carrying confirmed transactions. This constant is the modifier
+/// type used when relaying or requesting individual unconfirmed transactions.
+pub const TRANSACTION_TYPE_ID: u8 = 2;
 
 /// Compute the modifier IDs for the three non-header block sections.
 ///

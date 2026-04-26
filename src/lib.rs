@@ -28,7 +28,8 @@ pub use error::ChainError;
 pub use pow::verify_pow;
 pub use section::{
     required_section_ids, section_ids,
-    HEADER_TYPE_ID, BLOCK_TRANSACTIONS_TYPE_ID, AD_PROOFS_TYPE_ID, EXTENSION_TYPE_ID,
+    AD_PROOFS_TYPE_ID, BLOCK_TRANSACTIONS_TYPE_ID, EXTENSION_TYPE_ID, HEADER_TYPE_ID,
+    TRANSACTION_TYPE_ID,
 };
 pub use state_type::StateType;
 pub use sync_info::{build_sync_info, parse_sync_info, SyncInfo};

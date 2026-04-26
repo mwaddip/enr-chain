@@ -238,9 +238,7 @@ pub(crate) fn apply_ordinary_step(table: &mut HbHashMap<Parameter, i32>, signed_
 
     let new_val = if signed_id > 0 {
         if current < max { current + step } else { current }
-    } else {
-        if current > min { current - step } else { current }
-    };
+    } else if current > min { current - step } else { current };
     table.insert(param, new_val);
     true
 }
